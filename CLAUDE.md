@@ -120,6 +120,11 @@ com.{company}.{service}
 │   ├── domain/                      #   Base entity, AuditableEntity, common value objects
 │   ├── error/                       #   Sealed exception hierarchy, ProblemDetail factory
 │   ├── security/                    #   JWT filter, SecurityConfig, AuthContext
+│   ├── tenant/                      #   TenantContext, TenantId, TenantResolver (sealed)
+│   │   └── adapter/
+│   │       ├── web/                 #     TenantResolutionFilter (Servlet Filter)
+│   │       ├── grpc/                #     TenantGrpcInterceptor
+│   │       └── infra/               #     SchemaPerTenantConnectionProvider, TenantAwareRedisCacheManager, TenantFlywayMigrator
 │   ├── grpc/                        #   gRPC exception interceptor, common interceptors
 │   ├── web/                         #   Global @RestControllerAdvice, pagination utilities
 │   └── config/                      #   Cross-cutting Spring configs (Jackson, Redis, etc.)
@@ -146,13 +151,21 @@ com.{company}.{service}
 │   ├── repository/
 │   └── dto/
 │
-└── notification/                    # Push notification feature
-    ├── domain/
-    ├── port/                        #   NotificationSender (interface)
-    ├── service/
+├── notification/                    # Push notification feature
+│   ├── domain/
+│   ├── port/                        #   NotificationSender (interface)
+│   ├── service/
+│   ├── adapter/
+│   │   └── infra/                   #     FcmNotificationSender
+│   └── dto/
+│
+└── tenant/                          # Tenant management feature
+    ├── domain/                      #   Tenant entity (admin schema)
+    ├── service/                     #   TenantService (onboarding, deactivation)
     ├── adapter/
-    │   └── infra/                   #     FcmNotificationSender
-    └── dto/
+    │   └── web/                     #     TenantAdminController
+    ├── repository/                  #   TenantRepository
+    └── dto/                         #   CreateTenantRequest, TenantResponse
 ```
 
 ### Dependency rules (enforced)
@@ -369,7 +382,7 @@ var response = groupStub
 ### JWT rules
 
 - Sign with RS256 (asymmetric). Store private key in secrets manager, public key available to all services.
-- Access token claims: `sub` (user ID), `roles`, `groups`, `iat`, `exp`.
+- Access token claims: `sub` (user ID), `tid` (tenant ID — see Section 16), `roles`, `groups`, `iat`, `exp`.
 - Never store sensitive data in JWT claims (they are base64-encoded, not encrypted).
 
 ### Spring Security configuration
@@ -425,7 +438,8 @@ public sealed interface DomainException permits
     BusinessRuleViolation,
     AuthorizationException,
     ConflictException,
-    ValidationException {
+    ValidationException,
+    TenantNotFoundException {
 
     String code();    // Machine-readable: "GROUP_MEMBER_LIMIT_REACHED"
     String message(); // Human-readable description
@@ -449,6 +463,7 @@ public record BusinessRuleViolation(
 | BusinessRuleViolation       | 422         | FAILED_PRECONDITION |
 | AuthorizationException      | 403         | PERMISSION_DENIED   |
 | ConflictException           | 409         | ALREADY_EXISTS      |
+| TenantNotFoundException     | 404         | NOT_FOUND           |
 | Unexpected / unhandled      | 500         | INTERNAL            |
 
 ### Rules
@@ -468,6 +483,7 @@ public record BusinessRuleViolation(
 - Naming: `V001__create_users_table.sql`, `V002__create_groups_table.sql`.
 - Never modify a migration that has been applied. Create a new migration.
 - Use repeatable migrations (`R__`) only for views and functions.
+- **Multi-tenancy:** Disable auto-Flyway (`spring.flyway.enabled: false`) and use programmatic `TenantFlywayMigrator` to run migrations across all tenant schemas. See Section 16.
 
 ### JPA entities — pragmatic approach
 
@@ -522,6 +538,8 @@ spring:
       maximum-pool-size: 20         # Match to DB max connections / number of service instances
       minimum-idle: 5
       connection-timeout: 5000      # Fail fast if pool is exhausted
+      # Schema-per-tenant: single shared pool. Size based on total concurrent
+      # requests across ALL tenants, not per-tenant. See Section 16.
 ```
 
 ### Redis patterns
@@ -552,6 +570,7 @@ logging:
 - **WARN** for recoverable failures (retry succeeded, cache miss fallback).
 - **ERROR** only for unrecoverable failures requiring human attention.
 - Trace ID and span ID are included automatically with Micrometer Tracing bridge.
+- **Tenant ID** is included automatically via MDC — set by `TenantResolutionFilter` (REST) and `TenantGrpcInterceptor` (gRPC). See Section 16.
 - NEVER log sensitive data: passwords, tokens, OTP codes, PII.
 
 ### Custom business metrics
@@ -805,3 +824,486 @@ When rules conflict, apply this order:
 3. **Clarity** — code must be readable and maintainable
 4. **Performance** — optimize only when measurable
 5. **Conciseness** — reduce boilerplate, but not at the cost of clarity
+
+---
+
+## 16. MULTI-TENANCY
+
+Schema-per-tenant isolation using a single PostgreSQL database with separate schemas per tenant. Zero cross-tenant data leakage tolerance.
+
+### Tenant context
+
+```java
+public final class TenantContext {
+    private static final ThreadLocal<String> CURRENT_TENANT = new ThreadLocal<>();
+    // Future migration: replace with ScopedValue<String> when Spring Framework
+    // adds native support (see Spring Framework issue #32837).
+
+    public static String getCurrentTenant() {
+        String tenant = CURRENT_TENANT.get();
+        if (tenant == null) {
+            throw new IllegalStateException("No tenant context set");
+        }
+        return tenant;
+    }
+
+    public static @Nullable String getCurrentTenantOrNull() {
+        return CURRENT_TENANT.get();
+    }
+
+    public static void setCurrentTenant(String tenantId) {
+        CURRENT_TENANT.set(tenantId);
+    }
+
+    public static void clear() {
+        CURRENT_TENANT.remove();
+    }
+}
+
+// Tenant ID value object
+public record TenantId(@NotBlank String value) {
+    public TenantId {
+        if (!value.matches("^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")) {
+            throw new IllegalArgumentException("Invalid tenant ID format");
+        }
+    }
+    public String schemaName() {
+        return "tenant_" + value.replace("-", "_");
+    }
+}
+```
+
+### Tenant resolution — sealed interface with priority chain
+
+```java
+public sealed interface TenantResolver permits
+    JwtTenantResolver, HeaderTenantResolver, SubdomainTenantResolver {
+    @Nullable String resolve(HttpServletRequest request);
+}
+```
+
+| Resolver | Source | Use Case | Spoofing Risk |
+|----------|--------|----------|---------------|
+| `JwtTenantResolver` | JWT `tid` claim | Primary — mobile clients | None (JWT is signed) |
+| `HeaderTenantResolver` | `X-Tenant-ID` header | Service-to-service calls | High — must validate against JWT |
+| `SubdomainTenantResolver` | Request hostname | Web clients with vanity URLs | Medium — validate against registry |
+
+The filter tries resolvers in order: JWT claim first, then header, then subdomain.
+
+### REST tenant resolution — use Servlet Filter (NOT HandlerInterceptor)
+
+`HandlerInterceptor` is incompatible with `ScopedValue` due to its split lifecycle (`preHandle`/`afterCompletion`). Use a Servlet `Filter` to wrap the entire request.
+
+```java
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE + 10)  // After security filter
+public class TenantResolutionFilter implements Filter {
+
+    private final List<TenantResolver> resolvers;
+    private final TenantRegistry tenantRegistry;
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        var httpReq = (HttpServletRequest) req;
+
+        // Skip tenant resolution for public endpoints
+        if (isPublicEndpoint(httpReq)) {
+            chain.doFilter(req, res);
+            return;
+        }
+
+        String tenantId = resolvers.stream()
+            .map(r -> r.resolve(httpReq))
+            .filter(Objects::nonNull)
+            .findFirst()
+            .orElse(null);
+
+        if (tenantId == null || !tenantRegistry.isActive(tenantId)) {
+            ((HttpServletResponse) res).sendError(HttpServletResponse.SC_BAD_REQUEST,
+                "Missing or invalid tenant");
+            return;
+        }
+
+        TenantContext.setCurrentTenant(tenantId);
+        MDC.put("tenantId", tenantId);
+        try {
+            chain.doFilter(req, res);
+        } finally {
+            TenantContext.clear();
+            MDC.remove("tenantId");
+        }
+    }
+}
+```
+
+### gRPC tenant resolution — ServerInterceptor
+
+```java
+@Component
+public class TenantGrpcInterceptor implements ServerInterceptor {
+    private static final Metadata.Key<String> TENANT_KEY =
+        Metadata.Key.of("x-tenant-id", Metadata.ASCII_STRING_MARSHALLER);
+    private static final Context.Key<String> TENANT_CTX_KEY =
+        Context.key("tenantId");
+
+    @Override
+    public <ReqT, RespT> ServerCall.Listener<ReqT> interceptCall(
+            ServerCall<ReqT, RespT> call, Metadata headers,
+            ServerCallHandler<ReqT, RespT> next) {
+        String tenantId = headers.get(TENANT_KEY);
+        if (tenantId == null || !tenantRegistry.isActive(tenantId)) {
+            call.close(Status.INVALID_ARGUMENT
+                .withDescription("Missing or invalid X-Tenant-ID"), headers);
+            return new ServerCall.Listener<>() {};
+        }
+
+        Context ctx = Context.current().withValue(TENANT_CTX_KEY, tenantId);
+        return Contexts.interceptCall(ctx, call, headers,
+            new ServerCallHandler<>() {
+                @Override
+                public ServerCall.Listener<ReqT> startCall(
+                        ServerCall<ReqT, RespT> c, Metadata h) {
+                    TenantContext.setCurrentTenant(tenantId);
+                    MDC.put("tenantId", tenantId);
+                    return new ForwardingServerCallListener.SimpleForwardingServerCallListener<>(
+                            next.startCall(c, h)) {
+                        @Override
+                        public void onComplete() {
+                            try { super.onComplete(); }
+                            finally { TenantContext.clear(); MDC.remove("tenantId"); }
+                        }
+                        @Override
+                        public void onCancel() {
+                            try { super.onCancel(); }
+                            finally { TenantContext.clear(); MDC.remove("tenantId"); }
+                        }
+                    };
+                }
+            });
+    }
+}
+```
+
+### Schema-per-tenant — Hibernate integration
+
+Hibernate 7.1 infers multi-tenancy from the presence of these two SPIs — no `MultiTenancyStrategy` enum needed.
+
+```java
+@Component
+public class SchemaPerTenantConnectionProvider implements MultiTenantConnectionProvider<String> {
+
+    private final DataSource dataSource;
+
+    @Override
+    public Connection getConnection(String tenantIdentifier) throws SQLException {
+        var connection = dataSource.getConnection();
+        connection.createStatement().execute(
+            "SET search_path TO " + TenantId.of(tenantIdentifier).schemaName());
+        return connection;
+    }
+
+    @Override
+    public void releaseConnection(String tenantIdentifier, Connection connection)
+            throws SQLException {
+        // Reset to default schema before returning to pool
+        connection.createStatement().execute("SET search_path TO public");
+        connection.close();
+    }
+
+    @Override
+    public Connection getAnyConnection() throws SQLException {
+        return dataSource.getConnection();
+    }
+
+    @Override
+    public void releaseAnyConnection(Connection connection) throws SQLException {
+        connection.close();
+    }
+
+    @Override
+    public boolean supportsAggressiveRelease() {
+        return false;
+    }
+
+    @Override
+    public boolean isUnwrappableAs(Class<?> unwrapType) {
+        return false;
+    }
+
+    @Override
+    public <T> T unwrap(Class<T> unwrapType) {
+        throw new UnsupportedOperationException();
+    }
+}
+
+@Component
+public class TenantIdentifierResolver implements CurrentTenantIdentifierResolver<String> {
+
+    @Override
+    public String resolveCurrentTenantIdentifier() {
+        String tenant = TenantContext.getCurrentTenantOrNull();
+        return tenant != null ? tenant : "public";  // Fallback for system operations
+    }
+
+    @Override
+    public boolean validateExistingCurrentSessions() {
+        return true;
+    }
+}
+```
+
+Configuration:
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        multiTenancy: SCHEMA  # Informational — Hibernate 7.1 auto-detects from SPI beans
+```
+
+### Flyway — multi-tenant migrations
+
+Disable auto-Flyway and run migrations programmatically across all tenant schemas.
+
+```
+src/main/resources/db/migration/
+    admin/          # V001__create_tenants_table.sql (system/admin schema)
+    tenant/         # V001__create_users_table.sql (applied to each tenant schema)
+```
+
+```java
+@Component
+public class TenantFlywayMigrator {
+
+    private final DataSource dataSource;
+    private final TenantRepository tenantRepository;
+
+    /** Run on startup for all active tenants. */
+    @PostConstruct
+    public void migrateAll() {
+        // Migrate admin schema first
+        migrateSchema("public", "classpath:db/migration/admin");
+
+        // Then migrate each tenant schema
+        for (String tenantId : tenantRepository.findAllActiveTenantIds()) {
+            migrateSchema(new TenantId(tenantId).schemaName(),
+                "classpath:db/migration/tenant");
+        }
+    }
+
+    /** Called when onboarding a new tenant. */
+    public void migrateTenant(String tenantId) {
+        String schema = new TenantId(tenantId).schemaName();
+        createSchemaIfNotExists(schema);
+        migrateSchema(schema, "classpath:db/migration/tenant");
+    }
+
+    private void migrateSchema(String schema, String location) {
+        Flyway.configure()
+            .dataSource(dataSource)
+            .schemas(schema)
+            .locations(location)
+            .baselineOnMigrate(true)
+            .load()
+            .migrate();
+    }
+
+    private void createSchemaIfNotExists(String schema) {
+        try (var conn = dataSource.getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.execute("CREATE SCHEMA IF NOT EXISTS " + schema);
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to create schema: " + schema, e);
+        }
+    }
+}
+```
+
+```yaml
+spring:
+  flyway:
+    enabled: false   # Handled programmatically by TenantFlywayMigrator
+```
+
+### Tenant-aware Redis caching
+
+Override `RedisCacheManager` to automatically prefix cache names with tenant ID. This prevents developers from forgetting tenant isolation — it is transparent to `@Cacheable`/`@CacheEvict`.
+
+```java
+public class TenantAwareRedisCacheManager extends RedisCacheManager {
+
+    public TenantAwareRedisCacheManager(RedisCacheWriter cacheWriter,
+                                         RedisCacheConfiguration defaultConfig) {
+        super(cacheWriter, defaultConfig);
+    }
+
+    @Override
+    public Cache getCache(String name) {
+        String tenantId = TenantContext.getCurrentTenantOrNull();
+        String tenantCacheName = tenantId != null
+            ? tenantId + ":" + name
+            : name;
+        return super.getCache(tenantCacheName);
+    }
+}
+```
+
+All Redis keys must include tenant prefix:
+
+```
+{tenantId}:otp:{phoneNumber}           # OTP storage
+{tenantId}:ratelimit:{userId}:{endpoint} # Rate limiting
+{tenantId}:refresh:{tokenHash}          # Refresh tokens
+{tenantId}:users::user-123              # Cached entities
+```
+
+### Tenant-aware structured logging
+
+The `TenantResolutionFilter` and `TenantGrpcInterceptor` set `MDC.put("tenantId", tenantId)` around the request lifecycle. With ECS structured logging (Section 9), the `tenantId` field automatically appears in all log output:
+
+```json
+{"@timestamp":"2026-02-11T10:00:00Z","log.level":"INFO","message":"Group created","tenantId":"acme-corp","trace.id":"abc123"}
+```
+
+### Child thread propagation
+
+Virtual threads do not inherit `ThreadLocal` automatically. Use a `TaskDecorator` to propagate tenant context to `@Async` methods and `SimpleAsyncTaskExecutor`:
+
+```java
+@Bean
+public SimpleAsyncTaskExecutorCustomizer asyncCustomizer() {
+    return executor -> executor.setTaskDecorator(runnable -> {
+        String tenantId = TenantContext.getCurrentTenantOrNull();
+        return () -> {
+            if (tenantId != null) TenantContext.setCurrentTenant(tenantId);
+            try {
+                runnable.run();
+            } finally {
+                TenantContext.clear();
+            }
+        };
+    });
+}
+```
+
+When Java 25's `ScopedValue` + `StructuredTaskScope` are adopted, child threads will inherit scoped values automatically, eliminating this decorator.
+
+### Zero cross-tenant leakage — defense-in-depth
+
+| Layer | Mechanism | What It Prevents |
+|-------|-----------|-----------------|
+| **Request** | `TenantResolutionFilter` / `TenantGrpcInterceptor` validates tenant at entry | Invalid or missing tenant IDs |
+| **Application** | Services read from `TenantContext`, never accept tenant as a parameter | Accidental tenant parameter injection |
+| **Database** | Hibernate `search_path` isolation per connection | Queries hitting wrong schema |
+| **Database (defense)** | PostgreSQL Row Level Security policies (optional) | Bugs in schema switching |
+| **Cache** | Tenant-prefixed Redis keys via `TenantAwareRedisCacheManager` | Cache poisoning across tenants |
+| **JWT** | `tid` claim is signed — cannot be spoofed by clients | Tenant impersonation |
+
+**Anti-spoofing rule:** When both JWT `tid` and `X-Tenant-ID` header are present, they MUST match. Reject the request if they differ.
+
+**PostgreSQL RLS as defense-in-depth (optional but recommended):**
+
+```sql
+-- Applied per tenant schema as a safety net
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON users
+    USING (current_setting('app.current_tenant') = current_schema);
+```
+
+### Tenant lifecycle
+
+```java
+@Service
+public class TenantService {
+
+    private final TenantRepository tenantRepository;
+    private final TenantFlywayMigrator flywayMigrator;
+
+    @Transactional
+    public Tenant onboard(CreateTenantCommand cmd) {
+        var tenantId = new TenantId(cmd.tenantId());
+        if (tenantRepository.existsById(tenantId.value())) {
+            throw new ConflictException("TENANT_ALREADY_EXISTS",
+                "Tenant already exists: " + tenantId.value());
+        }
+
+        // 1. Create schema and run migrations
+        flywayMigrator.migrateTenant(tenantId.value());
+
+        // 2. Register in admin schema
+        var tenant = new Tenant(tenantId.value(), cmd.name(), TenantStatus.ACTIVE);
+        return tenantRepository.save(tenant);
+    }
+
+    @Transactional
+    public void deactivate(String tenantId) {
+        var tenant = tenantRepository.findById(tenantId)
+            .orElseThrow(() -> new ResourceNotFoundException(
+                "TENANT_NOT_FOUND", "Tenant not found", "Tenant", tenantId));
+        tenant.deactivate();
+        tenantRepository.save(tenant);
+    }
+}
+```
+
+### Testing — cross-tenant isolation
+
+```java
+@SpringBootTest
+@Testcontainers
+class CrossTenantIsolationTest {
+
+    @Test
+    void query_asTenantA_neverReturnsTenantBData() {
+        // Setup: create data in separate tenant schemas
+        runAsTenant("tenant-a", () ->
+            groupService.create(new CreateGroupCommand("Group A")));
+        runAsTenant("tenant-b", () ->
+            groupService.create(new CreateGroupCommand("Group B")));
+
+        // Verify: tenant A only sees their data
+        runAsTenant("tenant-a", () -> {
+            var groups = groupService.listAll();
+            assertThat(groups).extracting("name")
+                .containsExactly("Group A")
+                .doesNotContain("Group B");
+        });
+    }
+
+    @Test
+    void cache_isTenantIsolated() {
+        // Populate cache as tenant A
+        runAsTenant("tenant-a", () -> userService.getById(userId));
+
+        // Tenant B must not see tenant A's cached data
+        runAsTenant("tenant-b", () ->
+            assertThatThrownBy(() -> userService.getById(userId))
+                .isInstanceOf(ResourceNotFoundException.class));
+    }
+
+    @Test
+    void request_withMismatchedJwtAndHeader_isRejected() throws Exception {
+        mockMvc.perform(get("/api/groups")
+                .header("Authorization", "Bearer " + tenantAToken)
+                .header("X-Tenant-ID", "tenant-b"))
+            .andExpect(status().isForbidden());
+    }
+
+    private void runAsTenant(String tenantId, Runnable action) {
+        TenantContext.setCurrentTenant(tenantId);
+        try { action.run(); }
+        finally { TenantContext.clear(); }
+    }
+}
+```
+
+### Multi-tenancy rules summary
+
+- Tenant resolution happens ONCE at the request entry point (filter/interceptor), never deeper.
+- Services NEVER accept tenant ID as a method parameter — they read from `TenantContext`.
+- Every Redis key MUST include tenant prefix — enforced by `TenantAwareRedisCacheManager`.
+- Every log line MUST include `tenantId` — enforced by MDC in the resolution filter.
+- Cross-tenant isolation tests are MANDATORY for every feature that touches data or cache.
+- Tenant onboarding creates schema + runs migrations + registers in admin table — all in one transaction where possible.
