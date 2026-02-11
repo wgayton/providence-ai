@@ -16,6 +16,8 @@ You are a senior Spring Boot engineer building production-quality backend servic
 | JSON               | Jackson 3 (`tools.jackson`)                 | 3.x     |
 | Database           | PostgreSQL                                  | 17+     |
 | Cache / Ephemeral  | Redis                                       | 7+      |
+| Event Streaming    | Apache Kafka                                | 3.6+    |
+| CDC / Outbox       | Debezium                                    | 2.5+    |
 | ORM                | Hibernate ORM                               | 7.1+    |
 | Migrations         | Flyway                                      | 10+     |
 | Security           | Spring Security                             | 7.x     |
@@ -27,6 +29,8 @@ You are a senior Spring Boot engineer building production-quality backend servic
 **Dependency rules:**
 - Use `spring-boot-starter-opentelemetry` — NOT manual Micrometer wiring.
 - Use `spring-grpc-spring-boot-starter` — NOT third-party `net.devh` starters.
+- Use `spring-kafka` for Kafka integration — enable idempotence and exactly-once semantics.
+- Use Debezium Embedded Engine or Debezium Server for outbox pattern — NOT custom CDC solutions.
 - Use `JsonMapper` — NOT `ObjectMapper` — for Jackson 3.
 - Use `RestClient` — NOT `RestTemplate` — for outbound HTTP calls.
 - Use `org.jspecify.annotations.Nullable` — NOT `org.springframework.lang.Nullable`.
@@ -1483,3 +1487,648 @@ When rules conflict, apply this order:
 6. **Clarity** — code must be readable and maintainable
 7. **Performance** — optimize only when measurable
 8. **Conciseness** — reduce boilerplate, but not at the cost of clarity
+
+---
+
+## 24. EVENT-DRIVEN ARCHITECTURE (DEBEZIUM + KAFKA)
+
+### Architectural mandate
+
+Every state-changing operation must follow the **Outbox Pattern**:
+
+```
+Command → Transaction → [Domain Mutation + Outbox Event + Audit Log] → Commit
+  ↓
+Debezium CDC reads public.outbox_events
+  ↓
+Publishes to Kafka: ecap.events.<EventType>
+  ↓
+Consumers → Inbox deduplication → Apply projection
+```
+
+**Guarantees:**
+- Atomic: Domain change and event emission in same transaction
+- At-least-once delivery: Debezium ensures events reach Kafka
+- Exactly-once effects: Inbox pattern prevents duplicate processing
+
+---
+
+### Public schema tables
+
+**public.outbox_events (Debezium CDC source):**
+
+```sql
+CREATE TABLE public.outbox_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES public.tenants(id),
+    aggregate_type VARCHAR(100) NOT NULL,
+    aggregate_id UUID NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    event_version INT NOT NULL DEFAULT 1,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    correlation_id UUID NOT NULL,
+    causation_id UUID, -- Event that caused this event (chain)
+    actor_id UUID,
+    payload JSONB NOT NULL,
+    published_at TIMESTAMPTZ -- Set after Debezium publishes
+);
+
+CREATE INDEX idx_outbox_tenant_occurred ON public.outbox_events(tenant_id, occurred_at);
+CREATE INDEX idx_outbox_published_at ON public.outbox_events(published_at) WHERE published_at IS NULL;
+```
+
+**public.inbox_events (consumer deduplication):**
+
+```sql
+CREATE TABLE public.inbox_events (
+    tenant_id UUID NOT NULL,
+    consumer_name VARCHAR(100) NOT NULL,
+    event_id UUID NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, consumer_name, event_id)
+);
+```
+
+---
+
+### Outbox implementation
+
+**Step 1: Define domain event**
+
+```java
+package com.providence.project.domain.event;
+
+import java.time.Instant;
+import java.util.UUID;
+
+public sealed interface ProjectEvent permits
+    ProjectCreated, ProjectUpdated, ProjectArchived {
+    UUID projectId();
+    UUID tenantId();
+    Instant occurredAt();
+}
+
+public record ProjectCreated(
+    UUID projectId,
+    UUID tenantId,
+    String name,
+    Instant occurredAt
+) implements ProjectEvent {}
+```
+
+**Step 2: Emit event in transaction**
+
+```java
+@Service
+public class ProjectService {
+    private final ProjectRepository projectRepo;
+    private final OutboxService outboxService;
+
+    @Transactional
+    public Project create(CreateProjectCommand cmd) {
+        UUID tenantId = TenantContext.getCurrentTenantId();
+        String correlationId = TenantContext.getCurrentCorrelationId();
+
+        // 1. Mutate domain
+        Project project = new Project(cmd.name());
+        projectRepo.save(project);
+
+        // 2. Emit outbox event
+        ProjectCreated event = new ProjectCreated(
+            project.id(), tenantId, project.name(), Instant.now());
+
+        outboxService.publish(OutboxEvent.builder()
+            .tenantId(tenantId)
+            .aggregateType("Project")
+            .aggregateId(project.id())
+            .eventType("ProjectCreated")
+            .correlationId(UUID.fromString(correlationId))
+            .payload(event)
+            .build());
+
+        // Transaction commits → Debezium reads outbox → publishes to Kafka
+        return project;
+    }
+}
+```
+
+---
+
+### Inbox pattern (consumer deduplication)
+
+```java
+@Component
+public class ProjectEventConsumer {
+    private final InboxService inboxService;
+    private final NotificationService notificationService;
+
+    @KafkaListener(topics = "ecap.events.ProjectCreated", groupId = "notification-service")
+    @Transactional
+    public void handleProjectCreated(ProjectCreated event,
+                                      @Header("eventId") String eventId,
+                                      @Header("tenantId") String tenantId) {
+
+        UUID tenantUuid = UUID.fromString(tenantId);
+        UUID eventUuid = UUID.fromString(eventId);
+
+        // 1. Check if already processed (idempotent)
+        if (inboxService.isProcessed(tenantUuid, "NotificationSender", eventUuid)) {
+            return; // Skip duplicate
+        }
+
+        // 2. Mark as processed
+        inboxService.markProcessed(tenantUuid, "NotificationSender", eventUuid);
+
+        // 3. Apply business logic
+        notificationService.sendProjectCreatedNotification(event);
+
+        // Commit → exactly-once effect guaranteed
+    }
+}
+```
+
+---
+
+### Debezium connector configuration
+
+```json
+{
+  "name": "providence-outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "table.include.list": "public.outbox_events",
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.route.topic.replacement": "ecap.events.${routedByValue}"
+  }
+}
+```
+
+**Result:** Events published to Kafka topics `ecap.events.ProjectCreated`, `ecap.events.ProjectUpdated`, etc.
+
+---
+
+## 25. UNIVERSAL IDEMPOTENCY
+
+### Mandate
+
+ALL state-changing REST and gRPC endpoints MUST enforce idempotency:
+
+- Client provides `Idempotency-Key` header (REST) or `idempotency-key` metadata (gRPC)
+- Server stores in `public.idempotency_keys` with composite key: `(tenant_id, principal_id, command_name, idempotency_key)`
+- Duplicate requests return cached response without re-execution
+- Keys expire after 24 hours (configurable)
+
+---
+
+### Public schema table
+
+```sql
+CREATE TABLE public.idempotency_keys (
+    tenant_id UUID NOT NULL REFERENCES public.tenants(id),
+    principal_id UUID NOT NULL,
+    command_name VARCHAR(100) NOT NULL,
+    idempotency_key VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    response_payload JSONB,
+    PRIMARY KEY (tenant_id, principal_id, command_name, idempotency_key)
+);
+
+CREATE INDEX idx_idempotency_created ON public.idempotency_keys(created_at);
+```
+
+---
+
+### REST idempotency filter
+
+```java
+@Component
+public class IdempotencyFilter implements Filter {
+    private final IdempotencyService idempotencyService;
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+
+        // Only for state-changing methods
+        String method = httpRequest.getMethod();
+        if (!method.equals("POST") && !method.equals("PUT") &&
+            !method.equals("PATCH") && !method.equals("DELETE")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        // Require idempotency key
+        String idempotencyKey = httpRequest.getHeader("Idempotency-Key");
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            httpResponse.setStatus(400);
+            httpResponse.getWriter().write(
+                "{\"error\": \"Idempotency-Key header required\"}");
+            return;
+        }
+
+        UUID tenantId = TenantContext.getCurrentTenantId();
+        UUID principalId = SecurityContext.getCurrentUserId();
+        String commandName = deriveCommandName(httpRequest);
+
+        // Check cache
+        var cachedResponse = idempotencyService.getCachedResponse(
+            tenantId, principalId, commandName, idempotencyKey);
+
+        if (cachedResponse.isPresent()) {
+            // Return cached response (idempotent replay)
+            httpResponse.setStatus(cachedResponse.get().statusCode());
+            httpResponse.setContentType("application/json");
+            httpResponse.getWriter().write(cachedResponse.get().body());
+            return;
+        }
+
+        // Proceed with request
+        ResponseCapturingWrapper wrapper = new ResponseCapturingWrapper(httpResponse);
+        chain.doFilter(request, wrapper);
+
+        // Cache successful response
+        if (wrapper.getStatus() >= 200 && wrapper.getStatus() < 300) {
+            idempotencyService.cacheResponse(
+                tenantId, principalId, commandName, idempotencyKey,
+                wrapper.getStatus(), wrapper.getCapturedContent()
+            );
+        }
+    }
+
+    private String deriveCommandName(HttpServletRequest request) {
+        return request.getMethod() + "_" + request.getRequestURI().replaceAll("/", "_");
+    }
+}
+```
+
+---
+
+### IdempotencyService
+
+```java
+@Service
+public class IdempotencyService {
+    private final EntityManager entityManager;
+    private final ObjectMapper objectMapper;
+
+    public Optional<CachedResponse> getCachedResponse(UUID tenantId, UUID principalId,
+                                                       String commandName, String idempotencyKey) {
+        String sql = """
+            SELECT response_payload FROM public.idempotency_keys
+            WHERE tenant_id = ? AND principal_id = ? AND command_name = ? AND idempotency_key = ?
+            AND created_at > ?
+        """;
+
+        Instant cutoff = Instant.now().minus(24, ChronoUnit.HOURS);
+        var result = entityManager.createNativeQuery(sql)
+            .setParameter(1, tenantId)
+            .setParameter(2, principalId)
+            .setParameter(3, commandName)
+            .setParameter(4, idempotencyKey)
+            .setParameter(5, cutoff)
+            .getResultList();
+
+        if (result.isEmpty()) return Optional.empty();
+
+        String json = (String) result.get(0);
+        return Optional.of(objectMapper.readValue(json, CachedResponse.class));
+    }
+
+    @Transactional
+    public void cacheResponse(UUID tenantId, UUID principalId, String commandName,
+                               String idempotencyKey, int statusCode, String body) {
+        String sql = """
+            INSERT INTO public.idempotency_keys
+            (tenant_id, principal_id, command_name, idempotency_key, response_payload)
+            VALUES (?, ?, ?, ?, ?::jsonb)
+            ON CONFLICT DO NOTHING
+        """;
+
+        CachedResponse response = new CachedResponse(statusCode, body);
+        entityManager.createNativeQuery(sql)
+            .setParameter(1, tenantId)
+            .setParameter(2, principalId)
+            .setParameter(3, commandName)
+            .setParameter(4, idempotencyKey)
+            .setParameter(5, objectMapper.writeValueAsString(response))
+            .executeUpdate();
+    }
+}
+
+record CachedResponse(int statusCode, String body) {}
+```
+
+---
+
+## 26. SCHEMA-PER-TENANT ARCHITECTURE (ENHANCED)
+
+### Tenancy model
+
+**Architecture:** One PostgreSQL schema per tenant (`t_<tenant_slug>`)
+
+**Benefits:**
+- Complete data isolation (impossible to query across tenants)
+- Simplified queries (no `WHERE tenant_id =` clauses)
+- Tenant-specific schema evolution
+- Easier compliance (backup/restore/delete entire tenant)
+
+**Public schema infrastructure:**
+- `public.tenants` — tenant registry
+- `public.outbox_events` — Debezium outbox for all tenants
+- `public.audit_log` — immutable audit trail
+- `public.idempotency_keys` — universal idempotency
+- `public.inbox_events` — consumer deduplication
+
+---
+
+### Hibernate SCHEMA multi-tenancy configuration
+
+```java
+@Configuration
+public class MultiTenancyConfig {
+
+    @Bean
+    public HibernatePropertiesCustomizer hibernatePropertiesCustomizer(
+            MultiTenantConnectionProvider connectionProvider,
+            CurrentTenantIdentifierResolver tenantResolver) {
+
+        return hibernateProperties -> hibernateProperties.putAll(Map.of(
+            AvailableSettings.MULTI_TENANT_CONNECTION_PROVIDER, connectionProvider,
+            AvailableSettings.MULTI_TENANT_IDENTIFIER_RESOLVER, tenantResolver,
+            "hibernate.multi_tenant_strategy", "SCHEMA"
+        ));
+    }
+
+    @Bean
+    public MultiTenantConnectionProvider multiTenantConnectionProvider(DataSource dataSource) {
+        return new SchemaPerTenantConnectionProvider(dataSource);
+    }
+
+    @Bean
+    public CurrentTenantIdentifierResolver currentTenantIdentifierResolver() {
+        return new TenantIdentifierResolver();
+    }
+}
+```
+
+**SchemaPerTenantConnectionProvider:**
+
+```java
+public class SchemaPerTenantConnectionProvider implements MultiTenantConnectionProvider<String> {
+    private final DataSource dataSource;
+
+    @Override
+    public Connection getConnection(String tenantIdentifier) throws SQLException {
+        Connection connection = dataSource.getConnection();
+        // Set search_path to tenant schema + public
+        String searchPath = "t_" + tenantIdentifier + ", public";
+        connection.createStatement().execute("SET search_path TO " + searchPath);
+        return connection;
+    }
+
+    @Override
+    public void releaseConnection(String tenantIdentifier, Connection connection) throws SQLException {
+        connection.createStatement().execute("SET search_path TO public");
+        connection.close();
+    }
+}
+```
+
+---
+
+### Tenant resolution (JWT → Header → Subdomain)
+
+```java
+@Component
+public class TenantResolutionFilter implements Filter {
+    private final TenantRegistry tenantRegistry;
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        UUID tenantId = resolveTenantId(httpRequest);
+        String correlationId = resolveCorrelationId(httpRequest);
+
+        MDC.put("tenantId", tenantId.toString());
+        MDC.put("correlationId", correlationId);
+
+        try {
+            TenantContext.runInTenantContext(tenantId, correlationId, () -> {
+                try {
+                    chain.doFilter(request, response);
+                } catch (IOException | ServletException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+        } finally {
+            MDC.clear();
+        }
+    }
+
+    private UUID resolveTenantId(HttpServletRequest request) {
+        // 1. Try JWT claim
+        var auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth != null && auth.getPrincipal() instanceof Jwt jwt) {
+            String tenantIdClaim = jwt.getClaimAsString("tenantId");
+            if (tenantIdClaim != null) return UUID.fromString(tenantIdClaim);
+        }
+
+        // 2. Try X-Tenant-Id header
+        String headerTenantId = request.getHeader("X-Tenant-Id");
+        if (headerTenantId != null) return UUID.fromString(headerTenantId);
+
+        // 3. Try subdomain
+        String host = request.getHeader("Host");
+        if (host != null && host.contains(".")) {
+            String subdomain = host.split("\\.")[0];
+            return tenantRegistry.findBySlug(subdomain)
+                .orElseThrow(() -> new TenantNotFoundException("Tenant not found: " + subdomain));
+        }
+
+        throw new TenantNotFoundException("Cannot resolve tenant from request");
+    }
+
+    private String resolveCorrelationId(HttpServletRequest request) {
+        String correlationId = request.getHeader("X-Correlation-Id");
+        return (correlationId != null) ? correlationId : UUID.randomUUID().toString();
+    }
+}
+```
+
+---
+
+### Entity design — no tenant_id column needed
+
+With schema-per-tenant, entities do NOT need a `tenant_id` column. The schema itself provides isolation.
+
+```java
+@Entity
+@Table(name = "projects") // Lives in t_<tenant> schema
+public class Project extends AuditableEntity {
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @Column(nullable = false, length = 100)
+    private String name;
+
+    // No tenant_id column — schema isolation provides tenant boundary
+}
+```
+
+---
+
+### Flyway per-tenant migration strategy
+
+**Directory structure:**
+```
+src/main/resources/db/migration/
+├── public/
+│   ├── V001__create_tenants_table.sql
+│   ├── V002__create_outbox_events_table.sql
+│   └── V003__create_idempotency_keys_table.sql
+└── tenant/
+    ├── V001__create_projects_table.sql
+    └── V002__create_ledger_entries_table.sql
+```
+
+**Migration manager:**
+
+```java
+@Component
+public class TenantMigrationManager {
+    private final DataSource dataSource;
+    private final TenantRegistry tenantRegistry;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void migrateAllTenants() {
+        // 1. Migrate public schema first
+        Flyway.configure()
+            .dataSource(dataSource)
+            .locations("classpath:db/migration/public")
+            .schemas("public")
+            .load()
+            .migrate();
+
+        // 2. Migrate each tenant schema
+        tenantRegistry.findAll().forEach(tenant ->
+            Flyway.configure()
+                .dataSource(dataSource)
+                .locations("classpath:db/migration/tenant")
+                .schemas(tenant.getSchemaName())
+                .load()
+                .migrate()
+        );
+    }
+
+    public void provisionNewTenant(UUID tenantId, String slug) {
+        String schemaName = "t_" + slug;
+
+        // 1. Create schema
+        try (var conn = dataSource.getConnection();
+             var stmt = conn.createStatement()) {
+            stmt.execute("CREATE SCHEMA " + schemaName);
+        }
+
+        // 2. Register tenant
+        tenantRegistry.register(tenantId, slug, schemaName);
+
+        // 3. Run tenant migrations
+        Flyway.configure()
+            .dataSource(dataSource)
+            .locations("classpath:db/migration/tenant")
+            .schemas(schemaName)
+            .load()
+            .migrate();
+    }
+}
+```
+
+---
+
+## 27. PRODUCTION READINESS CHECKLIST (UPDATED)
+
+Before generating any architecture or code, apply this checklist:
+
+### 1. Domain model
+- [ ] Entities inherit from `AuditableEntity`.
+- [ ] Financial entities use `BigDecimal` for amounts, never `double` or `float`.
+- [ ] Immutable ledger entries have no update methods.
+- [ ] **NEW:** No `tenant_id` column (schema-per-tenant provides isolation).
+
+### 2. Isolation strategy
+- [ ] **NEW:** Hibernate SCHEMA multi-tenancy configured.
+- [ ] **NEW:** `SET search_path TO t_<tenant>, public` on connection acquire.
+- [ ] Cache keys include tenant ID prefix.
+- [ ] **NEW:** Public schema tables used for cross-tenant infrastructure.
+
+### 3. Transactional boundaries
+- [ ] Transactions are short (< 1 second).
+- [ ] No external service calls inside transactions.
+- [ ] Financial operations use `SERIALIZABLE` isolation or pessimistic locking.
+- [ ] **NEW:** Outbox event written in same transaction as domain mutation.
+
+### 4. Observability points
+- [ ] Structured logging includes `tenantId` and `correlationId` in MDC.
+- [ ] Custom metrics are tagged with `tenant_id` (beware cardinality).
+- [ ] Health checks verify database, Redis, and Kafka connectivity.
+- [ ] Distributed traces include tenant ID and correlation ID as span attributes.
+
+### 5. Failure modes
+- [ ] Circuit breakers protect external service calls.
+- [ ] Retries use exponential backoff and exclude non-retryable exceptions.
+- [ ] gRPC deadlines are set on all client calls.
+- [ ] **NEW:** Dead-letter topics for Kafka consumer failures.
+- [ ] **NEW:** Inbox pattern prevents duplicate event processing.
+
+### 6. Event-driven requirements
+- [ ] **NEW:** All state-changing operations emit outbox events.
+- [ ] **NEW:** Domain events are versioned (`event_version` field).
+- [ ] **NEW:** Correlation ID and causation ID tracked for event chains.
+- [ ] **NEW:** Kafka consumers use inbox pattern for exactly-once effects.
+
+### 7. Idempotency requirements
+- [ ] **NEW:** ALL state-changing REST endpoints require `Idempotency-Key` header.
+- [ ] **NEW:** ALL state-changing gRPC endpoints require `idempotency-key` metadata.
+- [ ] **NEW:** Idempotency keys stored in `public.idempotency_keys`.
+- [ ] **NEW:** Duplicate requests return cached response without re-execution.
+
+### 8. Migration strategy
+- [ ] Flyway migrations separated: `public/` and `tenant/`.
+- [ ] **NEW:** Public migrations run first, then tenant migrations.
+- [ ] **NEW:** Tenant provisioning includes schema creation + migrations.
+- [ ] Zero-downtime: deploy new code before running breaking migrations.
+
+### 9. Security & audit
+- [ ] Privilege changes (role assignments) generate audit events.
+- [ ] Financial operations generate immutable audit log entries in `public.audit_log`.
+- [ ] PII fields are encrypted at rest or masked in logs.
+- [ ] **NEW:** All state changes generate outbox events for audit trail.
+
+---
+
+## 28. RULES OF PRIORITY (FINAL)
+
+When rules conflict, apply this order:
+
+1. **Multi-tenant isolation** — never allow cross-tenant data leakage (schema-per-tenant enforces this at DB level)
+2. **Event integrity** — every state change must emit an outbox event atomically
+3. **Idempotency** — all state-changing operations must be idempotent and replayable
+4. **Financial correctness** — never compromise double-entry accounting, immutability, or audit trail
+5. **Security** — never compromise authentication, authorization, or input validation
+6. **Correctness** — code must be functionally correct
+7. **Observability** — every feature must be observable (logs, metrics, traces, events)
+8. **Clarity** — code must be readable and maintainable
+9. **Performance** — optimize only when measurable
+10. **Conciseness** — reduce boilerplate, but not at the cost of clarity
+
+---
+
+**Note:** Full implementation details, including complete Debezium connector setup, Kafka consumer examples, and public schema SQL migrations, are available in `CLAUDE_MD_ENHANCEMENT.md`.
+
