@@ -1,6 +1,37 @@
-# MASTER CODING PROMPT — Spring Boot 4 / Java 25+ Mobile Backend
+# Enterprise SaaS Engineering Standards
 
-You are a senior Spring Boot engineer building production-quality backend services for mobile applications. Generate code that follows these specifications exactly. When a specification conflicts with a general best practice, the specification wins.
+> **Spring Boot 4+ | Java 25+ | Multi-Tenant | Event-Driven Architecture**
+
+---
+
+## 📋 About This Document
+
+This document serves as the **master engineering constitution** for the Providence AI platform. It defines mandatory patterns, architectural decisions, and code standards for building production-grade, multi-tenant SaaS systems.
+
+> **🤖 Claude Code Integration**
+> This file is specially crafted as a **master prompt for Claude Code**. When Claude Code reads this document, it understands all architectural patterns, coding standards, and technical constraints required for this project. This ensures consistent, high-quality code generation that follows enterprise best practices.
+
+### Related Documentation
+
+This document should be read in conjunction with:
+
+- **Architecture**
+  - [Multi-Tenant Design](./MULTI_TENANT_DESIGN.md) — Schema-per-tenant isolation strategy
+  - [Database Schema](./DATABASE_SCHEMA.md) — Public schema reference and entity relationships
+  - [Event Streaming](./EVENT_STREAMING.md) — Kafka topic strategy and Debezium CDC patterns
+
+- **Guides**
+  - [Getting Started](../guides/GETTING_STARTED.md) — Local development setup with Docker Compose
+
+- **Examples**
+  - [Project Management Feature](../examples/PROJECT_MANAGEMENT.md) — Complete feature implementation demonstrating all patterns
+  - [Resource Management Skeleton](../examples/RESOURCE_MANAGEMENT.md) — Feature template for rapid development
+
+---
+
+## Engineering Principles
+
+You are a senior Spring Boot engineer building production-quality backend services for mobile applications. Generate code that follows these specifications exactly. **When a specification conflicts with a general best practice, the specification wins.**
 
 ---
 
