@@ -1,0 +1,207 @@
+version: '3.8'
+
+# ============================================================================
+# Providence AI - Local Development Environment
+# ============================================================================
+# Infrastructure for multi-tenant SaaS platform:
+# - PostgreSQL (with logical replication for Debezium)
+# - Redis (cache + rate limiting + OTP storage)
+# - Kafka + Zookeeper (event streaming)
+# - Debezium Connect (CDC for outbox pattern)
+#
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f        # View logs
+#   docker-compose down           # Stop all services
+#   docker-compose down -v        # Stop and remove volumes (clean slate)
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # PostgreSQL - Primary Database
+  # ==========================================================================
+  postgres:
+    image: postgres:17-alpine
+    container_name: providence-postgres
+    environment:
+      POSTGRES_DB: providence
+      POSTGRES_USER: providence
+      POSTGRES_PASSWORD: providence_dev_password
+      # Enable logical replication for Debezium CDC
+      POSTGRES_INITDB_ARGS: "-c wal_level=logical"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"           # Required for Debezium
+      - "-c"
+      - "max_wal_senders=10"          # Number of replication connections
+      - "-c"
+      - "max_replication_slots=10"    # Number of replication slots
+      - "-c"
+      - "shared_preload_libraries=pgcrypto"  # For encryption
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U providence"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - providence-network
+
+  # ==========================================================================
+  # Redis - Cache + Session Store
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: providence-redis
+    command: redis-server --appendonly yes --requirepass redis_dev_password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_dev_password", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - providence-network
+
+  # ==========================================================================
+  # Zookeeper - Kafka Coordination
+  # ==========================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: providence-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - providence-network
+
+  # ==========================================================================
+  # Kafka - Event Streaming Platform
+  # ==========================================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: providence-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Performance tuning
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824  # 1GB
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - providence-network
+
+  # ==========================================================================
+  # Debezium Connect - CDC for Outbox Pattern
+  # ==========================================================================
+  debezium:
+    image: debezium/connect:2.5
+    container_name: providence-debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: debezium-connect-cluster
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      # Replication factors (1 for local dev)
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # PostgreSQL connection for Debezium
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - providence-network
+
+  # ==========================================================================
+  # Kafka UI (Optional) - Web UI for Kafka Management
+  # ==========================================================================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: providence-kafka-ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: providence-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8080:8080"
+    networks:
+      - providence-network
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  zookeeper_logs:
+    driver: local
+  kafka_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  providence-network:
+    driver: bridge

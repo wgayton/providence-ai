@@ -1,0 +1,44 @@
+{
+  "name": "providence-outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "providence",
+    "database.password": "providence_dev_password",
+    "database.dbname": "providence",
+    "database.server.name": "providence",
+
+    "table.include.list": "public.outbox_events",
+
+    "plugin.name": "pgoutput",
+    "publication.name": "providence_outbox_publication",
+    "slot.name": "providence_outbox_slot",
+
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+    "transforms.outbox.table.field.event.id": "id",
+    "transforms.outbox.table.field.event.key": "tenant_id",
+    "transforms.outbox.table.field.event.type": "event_type",
+    "transforms.outbox.table.field.event.payload": "payload",
+    "transforms.outbox.table.field.event.timestamp": "occurred_at",
+    "transforms.outbox.route.topic.replacement": "ecap.events.${routedByValue}",
+
+    "tombstones.on.delete": "false",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+
+    "snapshot.mode": "initial",
+    "heartbeat.interval.ms": "10000",
+    "max.batch.size": "2048",
+    "max.queue.size": "8192",
+
+    "errors.tolerance": "none",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true"
+  }
+}
