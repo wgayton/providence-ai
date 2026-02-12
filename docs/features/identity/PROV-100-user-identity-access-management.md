@@ -1357,17 +1357,17 @@ Study `PROJECT_MANAGEMENT.md` as the canonical example. Copy its structure for:
 
 This story is comprehensive and may be decomposed into sub-stories during sprint planning:
 
-| Sub-Story | Scope | Priority |
-|-----------|-------|----------|
-| PROV-101 | User registration with OTP workflow | P0 |
-| PROV-102 | Login with brute-force throttling (3-attempt lockout) | P0 |
-| PROV-103 | Device fingerprinting and tracking | P0 |
-| PROV-104 | Security alerts (failed login, password change) | P1 |
-| PROV-105 | User roles and tenant-level RBAC | P0 |
-| PROV-106 | Spring Security hierarchy (tenant features + user grants with inherited levels) | P0 |
-| PROV-107 | Groups, group types, and group memberships | P1 |
-| PROV-108 | Default "System" tenant provisioning | P0 |
-| PROV-109 | Credential/profile separation enforcement | P0 |
+| Sub-Story | Scope | Priority | Story |
+|-----------|-------|----------|-------|
+| PROV-101 | User registration with OTP workflow | P0 | [PROV-101](PROV-101-user-registration-otp.md) |
+| PROV-102 | Login with brute-force throttling (3-attempt lockout) | P0 | [PROV-102](PROV-102-login-brute-force-throttling.md) |
+| PROV-103 | Device fingerprinting and tracking | P0 | [PROV-103](PROV-103-device-fingerprinting.md) |
+| PROV-104 | Security alerts (failed login, password change) | P1 | [PROV-104](PROV-104-security-alerts.md) |
+| PROV-105 | User roles and tenant-level RBAC | P0 | [PROV-105](PROV-105-user-roles-rbac.md) |
+| PROV-106 | Spring Security hierarchy (tenant features + user grants with inherited levels) | P0 | [PROV-106](PROV-106-spring-security-hierarchy.md) |
+| PROV-107 | Groups, group types, and group memberships | P1 | [PROV-107](PROV-107-groups-memberships.md) |
+| PROV-108 | Default "System" tenant provisioning | P0 | [PROV-108](PROV-108-system-tenant-provisioning.md) |
+| PROV-109 | Credential/profile separation enforcement | P0 | [PROV-109](PROV-109-credential-profile-separation.md) |
 
 ### Key Architectural Decisions
 
