@@ -58,15 +58,18 @@
 ### Groups & Roles
 - [ ] Users can belong to user-defined groups
 - [ ] Groups have a type (via `group_types` table) — e.g., `collaboration`, `department`, `team`
-- [ ] The `collaboration` group type enables in-group roles: `ADMIN`, `OWNER`, `MEMBER`, `EDITOR`, and extensible
-- [ ] Group memberships track the user's role within the group context
+- [ ] Each group type defines its available membership roles as a JSONB array (`available_roles` column)
+- [ ] The `collaboration` group type defines roles: `OWNER`, `ADMIN`, `EDITOR`, `MEMBER` — extensible via JSONB
+- [ ] Group types with `available_roles = NULL` do not support in-group roles (e.g., `department`)
+- [ ] Group membership role is validated at the application layer against the group type's `available_roles` keys
+- [ ] All enum-like columns (user status, tenant roles, feature levels, group statuses, alert types) use administered reference tables instead of CHECK constraints
 - [ ] `GroupCreatedEvent`, `GroupMemberAddedEvent`, `GroupMemberRoleChangedEvent` published via outbox
 
 ### Spring Security Hierarchy
 - [ ] **Tenant level:** Product features define enabled capabilities as authorities: `FEATURE_<FEATURE_KEY>_<LEVEL>` (e.g., `FEATURE_PROJECT_STANDARD`, `FEATURE_FINANCE_ENTERPRISE`)
 - [ ] **Feature levels:** `STANDARD`, `PRO`, `MAX`, `ENTERPRISE` — controls rate limits, user counts, and feature depth
-- [ ] **User level:** Tenant roles (`ROLE_ADMIN`, `ROLE_USER`, `ROLE_OWNER`) and per-user feature entitlements
-- [ ] **Group level:** Contextual group roles (`GROUP_ADMIN`, `GROUP_OWNER`, `GROUP_MEMBER`, `GROUP_EDITOR`)
+- [ ] **User level:** Tenant roles (`ROLE_ADMIN`, `ROLE_USER`, `ROLE_OWNER`) and per-user feature grants (boolean access — level inherited from tenant)
+- [ ] **Group level:** Contextual group roles derived from `group_types.available_roles` JSONB (e.g., `GROUP_{groupId}_OWNER`, `GROUP_{groupId}_ADMIN`)
 - [ ] JWT claims include: `sub` (user ID), `tenant_id`, `roles`, `features`, `exp`
 - [ ] Spring Security `GrantedAuthority` hierarchy resolves all levels for `@PreAuthorize` checks
 
@@ -131,6 +134,29 @@ Enterprise SaaS platforms require robust identity management that isolates authe
 
 ### Public Schema Changes
 
+**Feature Levels Reference** (`public.ref_feature_levels`):
+```sql
+-- Administered reference table for subscription feature levels
+-- Controls rate limits, user counts, and feature depth per tier
+CREATE TABLE IF NOT EXISTS public.ref_feature_levels (
+    code VARCHAR(20) PRIMARY KEY,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    display_order INT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed default feature levels
+INSERT INTO public.ref_feature_levels (code, label, description, display_order)
+VALUES
+    ('STANDARD', 'Standard', 'Base tier with core functionality', 1),
+    ('PRO', 'Professional', 'Enhanced tier with advanced features and higher limits', 2),
+    ('MAX', 'Max', 'Premium tier with maximum feature depth', 3),
+    ('ENTERPRISE', 'Enterprise', 'Full platform access with unlimited capacity', 4)
+ON CONFLICT (code) DO NOTHING;
+```
+
 **Tenant Product Features** (`public.tenant_product_features`):
 ```sql
 -- Defines what product features each tenant has enabled at their subscription tier
@@ -143,10 +169,9 @@ CREATE TABLE IF NOT EXISTS public.tenant_product_features (
     -- Feature identifier (e.g., 'PROJECT', 'FINANCE', 'RESOURCE', 'HUMAN')
     feature_key VARCHAR(100) NOT NULL,
 
-    -- Subscription level: STANDARD, PRO, MAX, ENTERPRISE
-    -- Controls rate limits, user counts, and feature depth
+    -- Subscription level — references administered ref_feature_levels table
     feature_level VARCHAR(20) NOT NULL
-        CHECK (feature_level IN ('STANDARD', 'PRO', 'MAX', 'ENTERPRISE')),
+        REFERENCES public.ref_feature_levels(code),
 
     -- Whether this feature is currently active for the tenant
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -180,11 +205,98 @@ VALUES (
 ) ON CONFLICT (slug) DO NOTHING;
 ```
 
-**Migration File:** `V006__create_tenant_product_features_table.sql` in `/src/main/resources/db/migration/public/`
+**Migration Files:**
+- `V006__create_ref_feature_levels_table.sql` in `/src/main/resources/db/migration/public/`
+- `V007__create_tenant_product_features_table.sql` in `/src/main/resources/db/migration/public/`
 
 ---
 
 ### Tenant Schema Changes (`t_<tenant>`)
+
+**User Statuses Reference** (`ref_user_statuses`):
+```sql
+-- Administered reference table for user lifecycle statuses
+CREATE TABLE IF NOT EXISTS ref_user_statuses (
+    code VARCHAR(30) PRIMARY KEY,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    display_order INT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO ref_user_statuses (code, label, description, display_order)
+VALUES
+    ('PENDING_VERIFICATION', 'Pending Verification', 'Registered, awaiting OTP verification', 1),
+    ('ACTIVE', 'Active', 'Verified and able to login', 2),
+    ('SUSPENDED', 'Suspended', 'Disabled by administrator', 3),
+    ('DEACTIVATED', 'Deactivated', 'Self-deactivated by user', 4)
+ON CONFLICT (code) DO NOTHING;
+```
+
+**Tenant Roles Reference** (`ref_tenant_roles`):
+```sql
+-- Administered reference table for tenant-level user roles
+-- ROLE_ prefix follows Spring Security convention
+CREATE TABLE IF NOT EXISTS ref_tenant_roles (
+    code VARCHAR(50) PRIMARY KEY,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    display_order INT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO ref_tenant_roles (code, label, description, display_order)
+VALUES
+    ('ROLE_OWNER', 'Owner', 'Full tenant control including termination', 1),
+    ('ROLE_ADMIN', 'Administrator', 'User management and configuration', 2),
+    ('ROLE_USER', 'User', 'Standard authenticated user', 3)
+ON CONFLICT (code) DO NOTHING;
+```
+
+**Group Statuses Reference** (`ref_group_statuses`):
+```sql
+-- Administered reference table for group lifecycle statuses
+CREATE TABLE IF NOT EXISTS ref_group_statuses (
+    code VARCHAR(20) PRIMARY KEY,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    display_order INT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO ref_group_statuses (code, label, description, display_order)
+VALUES
+    ('ACTIVE', 'Active', 'Group is operational', 1),
+    ('ARCHIVED', 'Archived', 'Group is read-only and no longer active', 2)
+ON CONFLICT (code) DO NOTHING;
+```
+
+**Alert Types Reference** (`ref_alert_types`):
+```sql
+-- Administered reference table for security alert classifications
+CREATE TABLE IF NOT EXISTS ref_alert_types (
+    code VARCHAR(50) PRIMARY KEY,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    display_order INT NOT NULL DEFAULT 0,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO ref_alert_types (code, label, description, display_order)
+VALUES
+    ('BRUTE_FORCE_DETECTED', 'Brute Force Detected', '3 failed login attempts on the account', 1),
+    ('PASSWORD_CHANGED', 'Password Changed', 'Account password was changed', 2),
+    ('NEW_DEVICE_LOGIN', 'New Device Login', 'Login from a previously unrecognized device', 3),
+    ('ACCOUNT_LOCKED', 'Account Locked', 'Account locked due to failed login attempts', 4),
+    ('ACCOUNT_UNLOCKED', 'Account Unlocked', 'Account unlocked after cooldown period expired', 5)
+ON CONFLICT (code) DO NOTHING;
+```
+
+---
 
 **Users — Identity Anchor** (`users`):
 ```sql
@@ -193,14 +305,9 @@ VALUES (
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-    -- User lifecycle
-    status VARCHAR(20) NOT NULL DEFAULT 'PENDING_VERIFICATION'
-        CHECK (status IN (
-            'PENDING_VERIFICATION', -- registered, awaiting OTP
-            'ACTIVE',               -- verified, can login
-            'SUSPENDED',            -- admin-disabled
-            'DEACTIVATED'           -- self-deactivated
-        )),
+    -- User lifecycle — references administered ref_user_statuses table
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING_VERIFICATION'
+        REFERENCES ref_user_statuses(code),
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -350,9 +457,10 @@ CREATE TABLE IF NOT EXISTS user_roles (
 
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 
-    -- Role name (ROLE_ prefix for Spring Security convention)
+    -- Role name — references administered ref_tenant_roles table
+    -- ROLE_ prefix follows Spring Security convention
     role VARCHAR(50) NOT NULL
-        CHECK (role IN ('ROLE_ADMIN', 'ROLE_USER', 'ROLE_OWNER')),
+        REFERENCES ref_tenant_roles(code),
 
     assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     assigned_by UUID, -- user who assigned this role (NULL for system-assigned)
@@ -367,8 +475,11 @@ CREATE INDEX idx_user_roles_role ON user_roles(role);
 
 **User Feature Entitlements** (`user_feature_entitlements`):
 ```sql
--- Per-user feature access within what the tenant allows
--- Resolves to Spring Security authorities: FEATURE_<key>_<level>
+-- Per-user feature access grant (boolean: user has access or not)
+-- The feature LEVEL is inherited from the tenant's tenant_product_features table —
+-- users do not have independent levels. This table only controls WHICH features
+-- a user can access; the depth/tier comes from the tenant subscription.
+-- Resolves to Spring Security authorities: FEATURE_<key>_<level> where level = tenant's level
 CREATE TABLE IF NOT EXISTS user_feature_entitlements (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -376,10 +487,6 @@ CREATE TABLE IF NOT EXISTS user_feature_entitlements (
 
     -- Feature key matching tenant_product_features.feature_key
     feature_key VARCHAR(100) NOT NULL,
-
-    -- Feature level (cannot exceed tenant's level)
-    feature_level VARCHAR(20) NOT NULL
-        CHECK (feature_level IN ('STANDARD', 'PRO', 'MAX', 'ENTERPRISE')),
 
     granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     granted_by UUID,
@@ -394,7 +501,8 @@ CREATE INDEX idx_user_features_user ON user_feature_entitlements(user_id);
 **Group Types** (`group_types`):
 ```sql
 -- Defines the types of groups that can be created
--- e.g., 'collaboration' (with in-group roles), 'department', 'team'
+-- Each group type declares its own available membership roles as a JSONB array
+-- Roles are linked to the group type: only roles defined here are valid for memberships
 CREATE TABLE IF NOT EXISTS group_types (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -402,8 +510,11 @@ CREATE TABLE IF NOT EXISTS group_types (
     slug VARCHAR(50) NOT NULL UNIQUE,
     description TEXT,
 
-    -- Whether this type supports in-group roles (admin, owner, member, editor)
-    supports_roles BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Available roles for this group type, stored as a JSONB array of role objects
+    -- Each object: {"key": "OWNER", "label": "Owner", "description": "...", "display_order": 1}
+    -- NULL or empty array means this group type does not support in-group roles
+    -- The "key" field is what gets stored in group_memberships.role
+    available_roles JSONB DEFAULT NULL,
 
     -- System-defined types cannot be deleted by users
     system_defined BOOLEAN NOT NULL DEFAULT FALSE,
@@ -411,12 +522,29 @@ CREATE TABLE IF NOT EXISTS group_types (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Seed default group types
-INSERT INTO group_types (id, name, slug, description, supports_roles, system_defined)
+-- Seed default group types with role definitions
+INSERT INTO group_types (id, name, slug, description, available_roles, system_defined)
 VALUES
-    (gen_random_uuid(), 'Collaboration', 'collaboration', 'Groups for team collaboration with role-based access', TRUE, TRUE),
-    (gen_random_uuid(), 'Department', 'department', 'Organizational department grouping', FALSE, TRUE),
-    (gen_random_uuid(), 'Team', 'team', 'Project or functional team grouping', FALSE, TRUE)
+    (gen_random_uuid(), 'Collaboration', 'collaboration',
+     'Groups for team collaboration with role-based access',
+     '[
+       {"key": "OWNER",  "label": "Owner",         "description": "Full control of the group",            "display_order": 1},
+       {"key": "ADMIN",  "label": "Administrator",  "description": "Can manage members and settings",      "display_order": 2},
+       {"key": "EDITOR", "label": "Editor",         "description": "Can edit group content",               "display_order": 3},
+       {"key": "MEMBER", "label": "Member",         "description": "Standard group member with read access","display_order": 4}
+     ]'::jsonb,
+     TRUE),
+    (gen_random_uuid(), 'Department', 'department',
+     'Organizational department grouping',
+     NULL,  -- no in-group roles
+     TRUE),
+    (gen_random_uuid(), 'Team', 'team',
+     'Project or functional team grouping',
+     '[
+       {"key": "LEAD",   "label": "Team Lead",  "description": "Leads the team",        "display_order": 1},
+       {"key": "MEMBER", "label": "Member",      "description": "Standard team member",  "display_order": 2}
+     ]'::jsonb,
+     TRUE)
 ON CONFLICT (slug) DO NOTHING;
 ```
 
@@ -431,9 +559,9 @@ CREATE TABLE IF NOT EXISTS groups (
 
     group_type_id UUID NOT NULL REFERENCES group_types(id) ON DELETE RESTRICT,
 
-    -- Lifecycle
+    -- Lifecycle — references administered ref_group_statuses table
     status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
-        CHECK (status IN ('ACTIVE', 'ARCHIVED')),
+        REFERENCES ref_group_statuses(code),
 
     created_by UUID NOT NULL REFERENCES users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -448,16 +576,19 @@ CREATE INDEX idx_groups_created_by ON groups(created_by);
 **Group Memberships** (`group_memberships`):
 ```sql
 -- Tracks which users belong to which groups, with their in-group role
--- Roles only apply to group types where supports_roles = TRUE
+-- The valid roles are defined by the group's type (group_types.available_roles JSONB)
+-- Role validation is enforced at the application layer by checking the role key
+-- against the group type's available_roles array
 CREATE TABLE IF NOT EXISTS group_memberships (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 
-    -- In-group role (applicable when group type supports_roles = TRUE)
-    role VARCHAR(50) NOT NULL DEFAULT 'MEMBER'
-        CHECK (role IN ('OWNER', 'ADMIN', 'EDITOR', 'MEMBER')),
+    -- In-group role — must match a "key" value in the parent group's
+    -- group_type.available_roles JSONB array
+    -- NULL when the group type has no available_roles defined
+    role VARCHAR(50),
 
     joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     invited_by UUID REFERENCES users(id),
@@ -468,7 +599,8 @@ CREATE TABLE IF NOT EXISTS group_memberships (
 
 CREATE INDEX idx_group_memberships_group ON group_memberships(group_id);
 CREATE INDEX idx_group_memberships_user ON group_memberships(user_id);
-CREATE INDEX idx_group_memberships_role ON group_memberships(group_id, role);
+CREATE INDEX idx_group_memberships_role ON group_memberships(group_id, role)
+    WHERE role IS NOT NULL;
 ```
 
 **Security Alerts** (`security_alerts`):
@@ -480,15 +612,9 @@ CREATE TABLE IF NOT EXISTS security_alerts (
 
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 
-    -- Alert classification
+    -- Alert classification — references administered ref_alert_types table
     alert_type VARCHAR(50) NOT NULL
-        CHECK (alert_type IN (
-            'BRUTE_FORCE_DETECTED',   -- 3 failed login attempts
-            'PASSWORD_CHANGED',       -- password was changed
-            'NEW_DEVICE_LOGIN',       -- login from unrecognized device
-            'ACCOUNT_LOCKED',         -- account locked due to failures
-            'ACCOUNT_UNLOCKED'        -- account unlocked after cooldown
-        )),
+        REFERENCES ref_alert_types(code),
 
     -- Alert content
     title VARCHAR(255) NOT NULL,
@@ -508,8 +634,9 @@ CREATE INDEX idx_security_alerts_unread ON security_alerts(user_id)
 ```
 
 **Migration Files:**
-- `V001__create_users_and_credentials.sql` in `/src/main/resources/db/migration/tenant/`
-- `V002__create_groups_and_memberships.sql` in `/src/main/resources/db/migration/tenant/`
+- `V001__create_reference_tables.sql` in `/src/main/resources/db/migration/tenant/` (ref_user_statuses, ref_tenant_roles, ref_group_statuses, ref_alert_types)
+- `V002__create_users_and_credentials.sql` in `/src/main/resources/db/migration/tenant/`
+- `V003__create_groups_and_memberships.sql` in `/src/main/resources/db/migration/tenant/`
 
 ---
 
@@ -724,6 +851,7 @@ Response: 200 OK
   "userId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   "roles": ["ROLE_USER"],
   "features": ["FEATURE_PROJECT_STANDARD", "FEATURE_FINANCE_PRO"]
+  // features: user is granted PROJECT and FINANCE; levels (STANDARD, PRO) inherited from tenant
 }
 
 Response: 423 Locked (after 3 failures)
@@ -971,15 +1099,15 @@ service GroupService {
 - [ ] `LoginAttempt.java` — Entity: login attempt record
 - [ ] `SecurityAlert.java` — Entity: security notification
 - [ ] `UserRole.java` — Value object: `ROLE_ADMIN`, `ROLE_USER`, `ROLE_OWNER`
-- [ ] `FeatureEntitlement.java` — Value object: feature key + level
+- [ ] `FeatureEntitlement.java` — Value object: feature key grant (boolean access; level inherited from tenant)
 - [ ] `Group.java` — Aggregate root for groups
 - [ ] `GroupId.java` — Value object (record)
 - [ ] `GroupType.java` — Entity: group type definition
 - [ ] `GroupMembership.java` — Entity: user-group with role
-- [ ] `GroupRole.java` — Value object: `OWNER`, `ADMIN`, `EDITOR`, `MEMBER`
+- [ ] `GroupRoleDefinition.java` — Value object (record): deserialized from `group_types.available_roles` JSONB (`key`, `label`, `description`, `displayOrder`)
 - [ ] `DeviceFingerprint.java` — Value object: fingerprint hash + device details
 - [ ] Domain events (sealed interface hierarchy — `UserEvent`, `GroupEvent`)
-- [ ] Business rules: 3-attempt lockout, OTP verification gate, credential separation invariant
+- [ ] Business rules: 3-attempt lockout, OTP verification gate, credential separation invariant, group role validation against type's available_roles
 
 ### Application Layer (`com.providence.identity.service`)
 - [ ] `AuthenticationService.java` — Registration, OTP, login, password change with `@Transactional`
@@ -1003,6 +1131,7 @@ service GroupService {
 - [ ] `GroupRepository.java` — `JpaRepository<Group, UUID>`
 - [ ] `GroupTypeRepository.java` — `JpaRepository<GroupType, UUID>` + `findBySlug`
 - [ ] `GroupMembershipRepository.java` — `JpaRepository<GroupMembership, UUID>`
+- [ ] Reference table repositories: `RefUserStatusRepository`, `RefTenantRoleRepository`, `RefGroupStatusRepository`, `RefAlertTypeRepository`
 - [ ] Outbox repository integration for all domain events
 - [ ] Audit logging integration for all state changes
 
@@ -1059,8 +1188,9 @@ class AuthenticationServiceTest {
 - [ ] Device fingerprint: new device → `UserDeviceRegistered` event
 - [ ] Device fingerprint: known device → `last_seen_at` updated, no event
 - [ ] Group creation: valid input → group created, creator added as OWNER
-- [ ] Group member role change: collaboration type → role updated
-- [ ] Group member role change: non-collaboration type → role change rejected
+- [ ] Group member role change: collaboration type → role updated (role key validated against available_roles JSONB)
+- [ ] Group member role change: type with no available_roles → role change rejected (400 Bad Request)
+- [ ] Group member role change: invalid role key not in available_roles → rejected (400 Bad Request)
 - [ ] Credential separation: profile query never returns password hash
 
 ### Integration Tests (Testcontainers)
@@ -1117,8 +1247,9 @@ class IdentityIntegrationTest {
 ```
 GrantedAuthorities for a user session:
 ├── Tenant Roles:     ROLE_ADMIN, ROLE_USER, ROLE_OWNER
-├── Tenant Features:  FEATURE_PROJECT_STANDARD, FEATURE_FINANCE_PRO, ...
-├── User Features:    FEATURE_RESOURCE_MAX (per-user override)
+├── User Features:    FEATURE_PROJECT_STANDARD, FEATURE_FINANCE_PRO, ...
+│                     (level inherited from tenant_product_features; user_feature_entitlements
+│                      controls WHICH features the user can access, not the level)
 └── Group Roles:      GROUP_{groupId}_ADMIN, GROUP_{groupId}_MEMBER
 ```
 
@@ -1233,7 +1364,7 @@ This story is comprehensive and may be decomposed into sub-stories during sprint
 | PROV-103 | Device fingerprinting and tracking | P0 |
 | PROV-104 | Security alerts (failed login, password change) | P1 |
 | PROV-105 | User roles and tenant-level RBAC | P0 |
-| PROV-106 | Spring Security hierarchy (tenant features + user features) | P0 |
+| PROV-106 | Spring Security hierarchy (tenant features + user grants with inherited levels) | P0 |
 | PROV-107 | Groups, group types, and group memberships | P1 |
 | PROV-108 | Default "System" tenant provisioning | P0 |
 | PROV-109 | Credential/profile separation enforcement | P0 |
@@ -1242,15 +1373,17 @@ This story is comprehensive and may be decomposed into sub-stories during sprint
 
 1. **Credential separation:** `credentials` and `user_profiles` are physically separate tables joined only by `user_id`. API responses for profile endpoints NEVER include credential fields. This prevents accidental leakage through serialization, logging, or caching.
 
-2. **Tenant product features in public schema:** `public.tenant_product_features` lives in the public schema because it describes what the tenant subscription includes — this is cross-tenant infrastructure akin to the `tenants` table itself. Per-user feature entitlements live in the tenant schema.
+2. **Tenant product features in public schema with inherited levels:** `public.tenant_product_features` lives in the public schema because it describes what the tenant subscription includes — this is cross-tenant infrastructure akin to the `tenants` table itself. Per-user `user_feature_entitlements` in the tenant schema are boolean grants (feature key only, no level). The feature level is always inherited from the tenant's `tenant_product_features.feature_level`. This avoids the complexity of per-user level overrides and ensures a user can never exceed the tenant's subscription tier. At authority resolution time, the system joins user grants with tenant levels to produce `FEATURE_<KEY>_<LEVEL>` authorities.
 
-3. **Group types with role support flag:** `group_types.supports_roles` determines whether a group type allows in-group roles. The `collaboration` type has this enabled; other types like `department` do not. This prevents role confusion in non-collaborative contexts.
+3. **Group types define available roles as JSONB:** `group_types.available_roles` is a JSONB array of role objects (`{"key", "label", "description", "display_order"}`). Each group type declares exactly which roles are valid for its memberships. The `collaboration` type defines `OWNER`, `ADMIN`, `EDITOR`, `MEMBER`; `team` defines `LEAD`, `MEMBER`; `department` has `NULL` (no roles). This links roles directly to the group type, makes them extensible without schema changes, and prevents role confusion across group types. Validation is enforced at the application layer by checking membership role against the type's available_roles keys.
 
-4. **Login attempts vs. audit log:** `login_attempts` is a tenant-schema table optimized for throttling queries (recent failures per user). The `public.audit_log` also records login events but serves a different purpose (compliance, forensics). Both are written.
+4. **Administered reference tables instead of CHECK constraints:** All enum-like columns (user statuses, tenant roles, feature levels, group statuses, alert types) use reference tables (`ref_*`) with FK constraints instead of `CHECK (x IN (...))`. This allows administrators to add, deactivate, or relabel values without DDL changes. Each reference table follows a standard structure: `code` (PK), `label`, `description`, `display_order`, `active`, `created_at`. Public-schema reference tables (`ref_feature_levels`) are shared across tenants; tenant-schema reference tables are per-tenant.
 
-5. **Device fingerprint as unique constraint:** `(user_id, fingerprint_hash)` ensures the same device is not duplicated. If the fingerprint matches, we update `last_seen_at` and `ip_address` rather than creating a new record.
+5. **Login attempts vs. audit log:** `login_attempts` is a tenant-schema table optimized for throttling queries (recent failures per user). The `public.audit_log` also records login events but serves a different purpose (compliance, forensics). Both are written.
 
-6. **Spring Security authority format:** `FEATURE_<KEY>_<LEVEL>` enables hierarchical feature gating. A `@PreAuthorize("hasAuthority('FEATURE_PROJECT_STANDARD')")` check will pass for users with STANDARD, PRO, MAX, or ENTERPRISE access when a custom `FeatureHierarchyVoter` is implemented.
+6. **Device fingerprint as unique constraint:** `(user_id, fingerprint_hash)` ensures the same device is not duplicated. If the fingerprint matches, we update `last_seen_at` and `ip_address` rather than creating a new record.
+
+7. **Spring Security authority format:** `FEATURE_<KEY>_<LEVEL>` enables hierarchical feature gating. A `@PreAuthorize("hasAuthority('FEATURE_PROJECT_STANDARD')")` check will pass for users with STANDARD, PRO, MAX, or ENTERPRISE access when a custom `FeatureHierarchyVoter` is implemented.
 
 ---
 
