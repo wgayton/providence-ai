@@ -1368,6 +1368,7 @@ This story is comprehensive and may be decomposed into sub-stories during sprint
 | PROV-107 | Groups, group types, and group memberships | P1 | [PROV-107](PROV-107-groups-memberships.md) |
 | PROV-108 | Default "System" tenant provisioning | P0 | [PROV-108](PROV-108-system-tenant-provisioning.md) |
 | PROV-109 | Credential/profile separation enforcement | P0 | [PROV-109](PROV-109-credential-profile-separation.md) |
+| PROV-110 | OTP SMS delivery path (alternative to email) | P1 | [PROV-110](PROV-110-otp-sms-delivery.md) |
 
 ### Key Architectural Decisions
 
