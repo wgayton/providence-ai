@@ -68,7 +68,7 @@
 ### Spring Security Hierarchy
 - [ ] **Tenant level:** Product features define enabled capabilities as authorities: `FEATURE_<FEATURE_KEY>_<LEVEL>` (e.g., `FEATURE_PROJECT_STANDARD`, `FEATURE_FINANCE_ENTERPRISE`)
 - [ ] **Feature levels:** `STANDARD`, `PRO`, `MAX`, `ENTERPRISE` — controls rate limits, user counts, and feature depth
-- [ ] **User level:** Tenant roles (`ROLE_ADMIN`, `ROLE_USER`, `ROLE_OWNER`) and per-user feature entitlements
+- [ ] **User level:** Tenant roles (`ROLE_ADMIN`, `ROLE_USER`, `ROLE_OWNER`) and per-user feature grants (boolean access — level inherited from tenant)
 - [ ] **Group level:** Contextual group roles derived from `group_types.available_roles` JSONB (e.g., `GROUP_{groupId}_OWNER`, `GROUP_{groupId}_ADMIN`)
 - [ ] JWT claims include: `sub` (user ID), `tenant_id`, `roles`, `features`, `exp`
 - [ ] Spring Security `GrantedAuthority` hierarchy resolves all levels for `@PreAuthorize` checks
@@ -475,8 +475,11 @@ CREATE INDEX idx_user_roles_role ON user_roles(role);
 
 **User Feature Entitlements** (`user_feature_entitlements`):
 ```sql
--- Per-user feature access within what the tenant allows
--- Resolves to Spring Security authorities: FEATURE_<key>_<level>
+-- Per-user feature access grant (boolean: user has access or not)
+-- The feature LEVEL is inherited from the tenant's tenant_product_features table —
+-- users do not have independent levels. This table only controls WHICH features
+-- a user can access; the depth/tier comes from the tenant subscription.
+-- Resolves to Spring Security authorities: FEATURE_<key>_<level> where level = tenant's level
 CREATE TABLE IF NOT EXISTS user_feature_entitlements (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
@@ -484,11 +487,6 @@ CREATE TABLE IF NOT EXISTS user_feature_entitlements (
 
     -- Feature key matching tenant_product_features.feature_key
     feature_key VARCHAR(100) NOT NULL,
-
-    -- Feature level (cannot exceed tenant's level)
-    -- References public.ref_feature_levels via search_path
-    feature_level VARCHAR(20) NOT NULL
-        REFERENCES public.ref_feature_levels(code),
 
     granted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     granted_by UUID,
@@ -853,6 +851,7 @@ Response: 200 OK
   "userId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   "roles": ["ROLE_USER"],
   "features": ["FEATURE_PROJECT_STANDARD", "FEATURE_FINANCE_PRO"]
+  // features: user is granted PROJECT and FINANCE; levels (STANDARD, PRO) inherited from tenant
 }
 
 Response: 423 Locked (after 3 failures)
@@ -1100,7 +1099,7 @@ service GroupService {
 - [ ] `LoginAttempt.java` — Entity: login attempt record
 - [ ] `SecurityAlert.java` — Entity: security notification
 - [ ] `UserRole.java` — Value object: `ROLE_ADMIN`, `ROLE_USER`, `ROLE_OWNER`
-- [ ] `FeatureEntitlement.java` — Value object: feature key + level
+- [ ] `FeatureEntitlement.java` — Value object: feature key grant (boolean access; level inherited from tenant)
 - [ ] `Group.java` — Aggregate root for groups
 - [ ] `GroupId.java` — Value object (record)
 - [ ] `GroupType.java` — Entity: group type definition
@@ -1248,8 +1247,9 @@ class IdentityIntegrationTest {
 ```
 GrantedAuthorities for a user session:
 ├── Tenant Roles:     ROLE_ADMIN, ROLE_USER, ROLE_OWNER
-├── Tenant Features:  FEATURE_PROJECT_STANDARD, FEATURE_FINANCE_PRO, ...
-├── User Features:    FEATURE_RESOURCE_MAX (per-user override)
+├── User Features:    FEATURE_PROJECT_STANDARD, FEATURE_FINANCE_PRO, ...
+│                     (level inherited from tenant_product_features; user_feature_entitlements
+│                      controls WHICH features the user can access, not the level)
 └── Group Roles:      GROUP_{groupId}_ADMIN, GROUP_{groupId}_MEMBER
 ```
 
@@ -1364,7 +1364,7 @@ This story is comprehensive and may be decomposed into sub-stories during sprint
 | PROV-103 | Device fingerprinting and tracking | P0 |
 | PROV-104 | Security alerts (failed login, password change) | P1 |
 | PROV-105 | User roles and tenant-level RBAC | P0 |
-| PROV-106 | Spring Security hierarchy (tenant features + user features) | P0 |
+| PROV-106 | Spring Security hierarchy (tenant features + user grants with inherited levels) | P0 |
 | PROV-107 | Groups, group types, and group memberships | P1 |
 | PROV-108 | Default "System" tenant provisioning | P0 |
 | PROV-109 | Credential/profile separation enforcement | P0 |
@@ -1373,7 +1373,7 @@ This story is comprehensive and may be decomposed into sub-stories during sprint
 
 1. **Credential separation:** `credentials` and `user_profiles` are physically separate tables joined only by `user_id`. API responses for profile endpoints NEVER include credential fields. This prevents accidental leakage through serialization, logging, or caching.
 
-2. **Tenant product features in public schema:** `public.tenant_product_features` lives in the public schema because it describes what the tenant subscription includes — this is cross-tenant infrastructure akin to the `tenants` table itself. Per-user feature entitlements live in the tenant schema.
+2. **Tenant product features in public schema with inherited levels:** `public.tenant_product_features` lives in the public schema because it describes what the tenant subscription includes — this is cross-tenant infrastructure akin to the `tenants` table itself. Per-user `user_feature_entitlements` in the tenant schema are boolean grants (feature key only, no level). The feature level is always inherited from the tenant's `tenant_product_features.feature_level`. This avoids the complexity of per-user level overrides and ensures a user can never exceed the tenant's subscription tier. At authority resolution time, the system joins user grants with tenant levels to produce `FEATURE_<KEY>_<LEVEL>` authorities.
 
 3. **Group types define available roles as JSONB:** `group_types.available_roles` is a JSONB array of role objects (`{"key", "label", "description", "display_order"}`). Each group type declares exactly which roles are valid for its memberships. The `collaboration` type defines `OWNER`, `ADMIN`, `EDITOR`, `MEMBER`; `team` defines `LEAD`, `MEMBER`; `department` has `NULL` (no roles). This links roles directly to the group type, makes them extensible without schema changes, and prevents role confusion across group types. Validation is enforced at the application layer by checking membership role against the type's available_roles keys.
 
