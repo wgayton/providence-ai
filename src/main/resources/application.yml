@@ -1,0 +1,45 @@
+spring:
+  application:
+    name: providence-ai
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/providence
+    username: postgres
+    password: postgres
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        default_schema: public
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration/public
+    schemas:
+      - public
+    baseline-on-migrate: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    com.providence: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.flywaydb: INFO
+
+providence:
+  tenant:
+    migration:
+      locations: classpath:db/migration/tenant
