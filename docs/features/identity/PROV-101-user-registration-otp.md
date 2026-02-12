@@ -30,8 +30,8 @@
 - [ ] Audit log entries created with `event_type=USER_REGISTERED` and `event_type=USER_OTP_VERIFIED`
 - [ ] Registration endpoint requires `Idempotency-Key` header — duplicate keys return cached response
 - [ ] OTP verification endpoint requires `Idempotency-Key` header
-- [ ] Input validation: username (required, unique), email (valid format), password (required), displayName (required)
-- [ ] Duplicate username returns `409 Conflict` with RFC 9457 ProblemDetail
+- [ ] Input validation: email (required, valid format, unique within tenant), password (required), displayName (required)
+- [ ] Duplicate email returns `409 Conflict` with RFC 9457 ProblemDetail
 - [ ] Invalid/expired OTP returns `401 Unauthorized`
 
 **Should Have (Nice to Have):**
@@ -84,7 +84,7 @@ Users need a secure way to create accounts within their organization's tenant bo
 
 **Key tables:**
 - `users` — Aggregate root with `status` FK to `ref_user_statuses`
-- `credentials` — Username, password hash, OTP secret, verification timestamp
+- `credentials` — Email (login identifier), password hash, OTP secret, verification timestamp
 - `user_profiles` — First name, last name, display name, email, phone, preferences
 
 **Migration:** `V002__create_users_and_credentials.sql` in `/src/main/resources/db/migration/tenant/`
@@ -110,7 +110,6 @@ Idempotency-Key: {uuid}
 Content-Type: application/json
 
 {
-  "username": "jane.doe",
   "email": "jane@example.com",
   "password": "SecureP@ssw0rd123",
   "firstName": "Jane",
@@ -161,11 +160,11 @@ service AuthService {
 ### Domain Layer (`com.providence.identity.domain`)
 - [ ] `User.java` — Aggregate root with status lifecycle (`PENDING_VERIFICATION` → `ACTIVE`)
 - [ ] `UserId.java` — Value object (record)
-- [ ] `Credential.java` — Entity: username, password hash, OTP secret, otp_verified_at
+- [ ] `Credential.java` — Entity: email (login identifier), password hash, OTP secret, otp_verified_at
 - [ ] `UserProfile.java` — Entity: personal info separated from credentials
 - [ ] `UserRegistered.java` — Domain event record
 - [ ] `UserOtpVerified.java` — Domain event record
-- [ ] Business rules: OTP verification gate, username uniqueness
+- [ ] Business rules: OTP verification gate, email uniqueness within tenant
 
 ### Application Layer (`com.providence.identity.service`)
 - [ ] `AuthenticationService.register()` — Creates user + credential + profile + outbox event in single `@Transactional`
@@ -176,7 +175,7 @@ service AuthService {
 
 ### Infrastructure Layer
 - [ ] `UserRepository.java` — `JpaRepository<User, UUID>`
-- [ ] `CredentialRepository.java` — `JpaRepository<Credential, UUID>` + `findByUsername`
+- [ ] `CredentialRepository.java` — `JpaRepository<Credential, UUID>` + `findByEmail`
 - [ ] `UserProfileRepository.java` — `JpaRepository<UserProfile, UUID>`
 - [ ] Outbox repository integration for `UserRegistered`, `UserOtpVerified`
 - [ ] Audit logging: `USER_REGISTERED`, `USER_OTP_VERIFIED`
@@ -191,7 +190,7 @@ service AuthService {
 
 **Unit Tests:**
 - [ ] Registration: valid input → creates user (PENDING_VERIFICATION), credential, profile, outbox event
-- [ ] Registration: duplicate username → 409 Conflict
+- [ ] Registration: duplicate email → 409 Conflict
 - [ ] Registration: missing required fields → validation error
 - [ ] OTP verification: valid OTP → user status becomes ACTIVE, JWT returned
 - [ ] OTP verification: invalid OTP → 401 Unauthorized, status unchanged
@@ -211,7 +210,7 @@ service AuthService {
 
 **Logging:**
 ```java
-log.info("User registered: userId={}, username={}", userId, username);
+log.info("User registered: userId={}, email={}", userId, email);
 log.info("OTP verified: userId={}", userId);
 log.warn("OTP verification failed: userId={}, reason={}", userId, reason);
 ```

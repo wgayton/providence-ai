@@ -21,7 +21,7 @@
 
 **Must Have (Required):**
 - [ ] `credentials` table and `user_profiles` table are physically separate, joined only by `user_id` FK to `users`
-- [ ] `credentials` contains ONLY: username, password_hash, otp_secret, otp_verified_at, failed_attempt_count, locked_until, last_failed_at, password_changed_at
+- [ ] `credentials` contains ONLY: email (login identifier), password_hash, otp_secret, otp_verified_at, failed_attempt_count, locked_until, last_failed_at, password_changed_at
 - [ ] `user_profiles` contains ONLY: first_name, last_name, display_name, email, phone, timezone, locale, bio
 - [ ] `GET /api/v1/users/me` response includes profile data and roles but NEVER password_hash, otp_secret, or any credential field
 - [ ] `GET /api/v1/users` (admin list) response NEVER includes credential fields
