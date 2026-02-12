@@ -12,7 +12,7 @@
 ## User Story
 
 **As a** registered user with a verified account
-**I want to** login with my username and password, with the system protecting my account by locking it after 3 consecutive failed attempts
+**I want to** login with my email and password, with the system protecting my account by locking it after 3 consecutive failed attempts
 **So that** I can securely access the platform while being protected from brute-force attacks
 
 ---
@@ -20,7 +20,7 @@
 ## Acceptance Criteria
 
 **Must Have (Required):**
-- [ ] User can login with username/email and password against the tenant subdomain
+- [ ] User can login with email and password against the tenant subdomain
 - [ ] Successful login returns a JWT with claims: `sub` (user ID), `tenant_id`, `roles`, `features`, `exp`
 - [ ] System tracks all login attempts (success and failure) in `login_attempts` table with IP, device fingerprint, and user agent
 - [ ] After 3 consecutive failed login attempts, the account is locked for a configurable cooldown period (default 15 minutes)
@@ -106,7 +106,7 @@ Host: {tenant-slug}.providence.ai
 Content-Type: application/json
 
 {
-  "username": "jane.doe",
+  "email": "jane@example.com",
   "password": "SecureP@ssw0rd123",
   "deviceFingerprint": "a1b2c3d4e5..."
 }

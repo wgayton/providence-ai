@@ -28,7 +28,8 @@
 - [ ] Audit log entry created with `event_type=USER_REGISTERED`
 
 ### Login & Brute-Force Protection
-- [ ] User can login with username/email and password against the tenant subdomain
+- [ ] User can login with email and password against the tenant subdomain (or via TLD with tenant resolution — see PROV-111)
+- [ ] Email is the sole login identifier — all logins must be a valid email address
 - [ ] System tracks all login attempts (success and failure) with IP, device fingerprint, and user agent
 - [ ] After 3 consecutive failed login attempts, the account is locked (throttled) for a configurable cooldown period
 - [ ] `UserAccountLockedEvent` published when account is locked after 3 failed attempts
@@ -205,9 +206,35 @@ VALUES (
 ) ON CONFLICT (slug) DO NOTHING;
 ```
 
+**User-Tenant Map** (`public.user_tenant_map`):
+```sql
+-- Cross-tenant lookup: maps login email → tenant for TLD-level authentication
+-- Populated atomically during registration (same transaction)
+-- Enables mobile apps and clients without subdomain access to resolve tenant
+CREATE TABLE IF NOT EXISTS public.user_tenant_map (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- Login email (must be a valid email address)
+    email VARCHAR(255) NOT NULL,
+
+    tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,  -- tenant-schema user ID (no FK — cross-schema)
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Same email can map to multiple tenants (user has accounts in several orgs)
+    -- Same email + tenant is unique (one mapping per user per tenant)
+    CONSTRAINT uq_user_tenant_email UNIQUE (email, tenant_id)
+);
+
+CREATE INDEX idx_user_tenant_map_email ON public.user_tenant_map(email);
+CREATE INDEX idx_user_tenant_map_tenant ON public.user_tenant_map(tenant_id);
+```
+
 **Migration Files:**
 - `V006__create_ref_feature_levels_table.sql` in `/src/main/resources/db/migration/public/`
 - `V007__create_tenant_product_features_table.sql` in `/src/main/resources/db/migration/public/`
+- `V008__create_user_tenant_map_table.sql` in `/src/main/resources/db/migration/public/`
 
 ---
 
@@ -325,8 +352,8 @@ CREATE TABLE IF NOT EXISTS credentials (
 
     user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
 
-    -- Login identifier (unique within tenant)
-    username VARCHAR(255) NOT NULL UNIQUE,
+    -- Login identifier — must be a valid email address (unique within tenant)
+    email VARCHAR(255) NOT NULL UNIQUE,
 
     -- bcrypt/argon2 password hash (NEVER store plaintext)
     password_hash VARCHAR(255) NOT NULL,
@@ -347,7 +374,7 @@ CREATE TABLE IF NOT EXISTS credentials (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_credentials_username ON credentials(username);
+CREATE INDEX idx_credentials_email ON credentials(email);
 CREATE INDEX idx_credentials_user_id ON credentials(user_id);
 CREATE INDEX idx_credentials_locked ON credentials(user_id)
     WHERE locked_until IS NOT NULL AND locked_until > NOW();
@@ -428,7 +455,7 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     user_id UUID REFERENCES users(id) ON DELETE SET NULL, -- NULL if user not found
-    username VARCHAR(255) NOT NULL,                       -- attempted username (even if invalid)
+    email VARCHAR(255) NOT NULL,                          -- attempted email (even if invalid)
 
     -- Outcome
     success BOOLEAN NOT NULL,
@@ -659,7 +686,6 @@ public record UserRegistered(
     UUID eventId,
     String tenantId,
     UUID userId,
-    String username,
     String email,
     String deviceFingerprint,
     String ipAddress,
@@ -670,7 +696,7 @@ public record UserLoginFailed(
     UUID eventId,
     String tenantId,
     UUID userId,
-    String username,
+    String email,
     String ipAddress,
     String deviceFingerprint,
     String failureReason,
@@ -682,7 +708,7 @@ public record UserAccountLocked(
     UUID eventId,
     String tenantId,
     UUID userId,
-    String username,
+    String email,
     int failedAttemptCount,
     Instant lockedUntil,
     String ipAddress,
@@ -796,7 +822,6 @@ Idempotency-Key: {uuid}
 Content-Type: application/json
 
 {
-  "username": "jane.doe",
   "email": "jane@example.com",
   "password": "SecureP@ssw0rd123",
   "firstName": "Jane",
@@ -839,7 +864,7 @@ Host: {tenant-slug}.providence.ai
 Content-Type: application/json
 
 {
-  "username": "jane.doe",
+  "email": "jane@example.com",
   "password": "SecureP@ssw0rd123",
   "deviceFingerprint": "a1b2c3d4e5..."
 }
@@ -1093,7 +1118,7 @@ service GroupService {
 ### Domain Layer (`com.providence.identity.domain`)
 - [ ] `User.java` — Aggregate root entity with status lifecycle
 - [ ] `UserId.java` — Value object (record)
-- [ ] `Credential.java` — Entity: username, password hash, OTP, lockout state
+- [ ] `Credential.java` — Entity: email (login identifier), password hash, OTP, lockout state
 - [ ] `UserProfile.java` — Entity: personal info separated from credentials
 - [ ] `UserDevice.java` — Entity: device fingerprint, browser, OS details
 - [ ] `LoginAttempt.java` — Entity: login attempt record
@@ -1121,7 +1146,7 @@ service GroupService {
 
 ### Infrastructure Layer (`com.providence.identity.repository`)
 - [ ] `UserRepository.java` — `JpaRepository<User, UUID>`
-- [ ] `CredentialRepository.java` — `JpaRepository<Credential, UUID>` + `findByUsername`
+- [ ] `CredentialRepository.java` — `JpaRepository<Credential, UUID>` + `findByEmail`
 - [ ] `UserProfileRepository.java` — `JpaRepository<UserProfile, UUID>`
 - [ ] `UserDeviceRepository.java` — `JpaRepository<UserDevice, UUID>` + `findByUserIdAndFingerprintHash`
 - [ ] `LoginAttemptRepository.java` — `JpaRepository<LoginAttempt, UUID>` + recent failures query
@@ -1176,7 +1201,7 @@ class AuthenticationServiceTest {
 
 **Test Cases:**
 - [ ] Registration: valid input → creates user (PENDING_VERIFICATION), credential, profile, outbox event
-- [ ] Registration: duplicate username → 409 Conflict
+- [ ] Registration: duplicate email → 409 Conflict
 - [ ] OTP verification: valid OTP → user status becomes ACTIVE
 - [ ] OTP verification: invalid OTP → 401 Unauthorized, status unchanged
 - [ ] Login: valid credentials + verified account → JWT returned, attempt logged as success
@@ -1270,7 +1295,7 @@ MDC.put("tenantId", tenantId);
 MDC.put("correlationId", correlationId);
 MDC.put("userId", userId);
 
-log.info("User registered: userId={}, username={}", userId, username);
+log.info("User registered: userId={}, email={}", userId, email);
 log.warn("Login failed: userId={}, attempt={}/3, ip={}", userId, count, ip);
 log.warn("Account locked: userId={}, lockedUntil={}, ip={}", userId, lockedUntil, ip);
 log.info("Password changed: userId={}", userId);
@@ -1369,6 +1394,7 @@ This story is comprehensive and may be decomposed into sub-stories during sprint
 | PROV-108 | Default "System" tenant provisioning | P0 | [PROV-108](PROV-108-system-tenant-provisioning.md) |
 | PROV-109 | Credential/profile separation enforcement | P0 | [PROV-109](PROV-109-credential-profile-separation.md) |
 | PROV-110 | OTP SMS delivery path (alternative to email) | P1 | [PROV-110](PROV-110-otp-sms-delivery.md) |
+| PROV-111 | TLD user-to-tenant resolution via `public.user_tenant_map` | P1 | [PROV-111](PROV-111-tld-tenant-resolution.md) |
 
 ### Key Architectural Decisions
 
