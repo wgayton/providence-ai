@@ -1,5 +1,7 @@
 package com.providence.identity;
 
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 import com.providence.identity.domain.Credential;
 import com.providence.identity.domain.User;
 import com.providence.identity.domain.UserProfile;
@@ -16,6 +18,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -63,6 +66,9 @@ class CredentialSeparationIntegrationTest {
 
     @Autowired
     private UserProfileRepository userProfileRepository;
+
+    @Autowired
+    private JsonMapper jsonMapper;
 
     private UUID testUserId;
     private final BCryptPasswordEncoder encoder = new BCryptPasswordEncoder();
@@ -152,14 +158,18 @@ class CredentialSeparationIntegrationTest {
     }
 
     /**
-     * POST /api/v1/auth/password/change — must only modify credentials, not user_profiles.
+     * Two-step OTP password change must only modify credentials, not user_profiles.
+     *
+     * Step 1: POST /api/v1/auth/password/change → returns verificationId + OTP
+     * Step 2: POST /api/v1/auth/password/change/confirm → applies password change
      */
     @Test
-    void changePassword_doesNotModifyProfile() throws Exception {
+    void changePassword_otpLifecycle_doesNotModifyProfile() throws Exception {
         UserProfile beforeChange = userProfileRepository.findByUserId(testUserId).orElseThrow();
         String displayNameBefore = beforeChange.getDisplayName();
 
-        mockMvc.perform(post("/api/v1/auth/password/change")
+        // Step 1: Initiate password change — verify current password, get OTP
+        MvcResult initiateResult = mockMvc.perform(post("/api/v1/auth/password/change")
                         .header("X-User-ID", testUserId.toString())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -169,19 +179,48 @@ class CredentialSeparationIntegrationTest {
                             }
                             """))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.message").value("Password changed successfully."));
+                .andExpect(jsonPath("$.message").exists())
+                .andExpect(jsonPath("$.verificationId").exists())
+                .andExpect(jsonPath("$.otp").exists())
+                .andReturn();
 
-        // Verify user_profiles table is unchanged
+        // Extract verificationId and OTP from Step 1 response
+        JsonNode initiateBody = jsonMapper.readTree(
+                initiateResult.getResponse().getContentAsString());
+        String verificationId = initiateBody.get("verificationId").asText();
+        String otp = initiateBody.get("otp").asText();
+
+        // Step 2: Confirm password change with OTP
+        mockMvc.perform(post("/api/v1/auth/password/change/confirm")
+                        .header("X-User-ID", testUserId.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            {
+                                "verificationId": "%s",
+                                "otpCode": "%s"
+                            }
+                            """.formatted(verificationId, otp)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Password changed successfully."))
+                .andExpect(jsonPath("$.changedAt").exists());
+
+        // Verify user_profiles table is unchanged after full OTP lifecycle
         UserProfile afterChange = userProfileRepository.findByUserId(testUserId).orElseThrow();
         org.assertj.core.api.Assertions.assertThat(afterChange.getDisplayName())
                 .isEqualTo(displayNameBefore);
+
+        // Verify password was actually changed
+        Credential afterCred = credentialRepository.findByUserId(testUserId).orElseThrow();
+        org.assertj.core.api.Assertions.assertThat(
+                encoder.matches("NewSecureP@ss456", afterCred.getPasswordHash())).isTrue();
     }
 
     /**
-     * Password change response must not contain any credential data.
+     * Password change initiate response must not expose credential data.
+     * It should only contain message, verificationId, and OTP.
      */
     @Test
-    void changePassword_responseDoesNotExposeCredentials() throws Exception {
+    void changePasswordInitiate_responseDoesNotExposeCredentials() throws Exception {
         mockMvc.perform(post("/api/v1/auth/password/change")
                         .header("X-User-ID", testUserId.toString())
                         .contentType(MediaType.APPLICATION_JSON)
@@ -195,6 +234,50 @@ class CredentialSeparationIntegrationTest {
                 .andExpect(jsonPath("$.passwordHash").doesNotExist())
                 .andExpect(jsonPath("$.password_hash").doesNotExist())
                 .andExpect(jsonPath("$.otpSecret").doesNotExist())
+                .andExpect(jsonPath("$.message").exists())
+                .andExpect(jsonPath("$.verificationId").exists())
+                .andExpect(jsonPath("$.otp").exists());
+    }
+
+    /**
+     * Password change confirm response must not expose credential data.
+     * It should only contain message and changedAt.
+     */
+    @Test
+    void changePasswordConfirm_responseDoesNotExposeCredentials() throws Exception {
+        // Step 1: Initiate to get verificationId and OTP
+        MvcResult initiateResult = mockMvc.perform(post("/api/v1/auth/password/change")
+                        .header("X-User-ID", testUserId.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            {
+                                "currentPassword": "SecureP@ssw0rd123",
+                                "newPassword": "NewSecureP@ss456"
+                            }
+                            """))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        JsonNode initiateBody = jsonMapper.readTree(
+                initiateResult.getResponse().getContentAsString());
+        String verificationId = initiateBody.get("verificationId").asText();
+        String otp = initiateBody.get("otp").asText();
+
+        // Step 2: Confirm and verify response fields
+        mockMvc.perform(post("/api/v1/auth/password/change/confirm")
+                        .header("X-User-ID", testUserId.toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                            {
+                                "verificationId": "%s",
+                                "otpCode": "%s"
+                            }
+                            """.formatted(verificationId, otp)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.passwordHash").doesNotExist())
+                .andExpect(jsonPath("$.password_hash").doesNotExist())
+                .andExpect(jsonPath("$.otpSecret").doesNotExist())
+                .andExpect(jsonPath("$.newPasswordHash").doesNotExist())
                 .andExpect(jsonPath("$.message").exists())
                 .andExpect(jsonPath("$.changedAt").exists());
     }
