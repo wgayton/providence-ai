@@ -89,4 +89,37 @@ class CredentialSeparationDtoTest {
         // Should contain only password fields
         assertThat(fieldNames).containsExactlyInAnyOrder("currentPassword", "newPassword");
     }
+
+    @Test
+    void changePasswordResponse_doesNotExposeCredentialData() {
+        RecordComponent[] components = ChangePasswordResponse.class.getRecordComponents();
+        var fieldNames = Arrays.stream(components)
+                .map(RecordComponent::getName)
+                .toList();
+
+        for (String forbidden : FORBIDDEN_CREDENTIAL_FIELDS) {
+            assertThat(fieldNames)
+                    .as("ChangePasswordResponse must not contain credential field: %s", forbidden)
+                    .doesNotContain(forbidden);
+        }
+
+        // Should contain verification-related fields only
+        assertThat(fieldNames).containsExactlyInAnyOrder("message", "verificationId", "otp");
+    }
+
+    @Test
+    void confirmPasswordChangeResponse_doesNotExposeCredentialData() {
+        RecordComponent[] components = ConfirmPasswordChangeResponse.class.getRecordComponents();
+        var fieldNames = Arrays.stream(components)
+                .map(RecordComponent::getName)
+                .toList();
+
+        for (String forbidden : FORBIDDEN_CREDENTIAL_FIELDS) {
+            assertThat(fieldNames)
+                    .as("ConfirmPasswordChangeResponse must not contain credential field: %s", forbidden)
+                    .doesNotContain(forbidden);
+        }
+
+        assertThat(fieldNames).containsExactlyInAnyOrder("message", "changedAt");
+    }
 }
